@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.action.cdc.format.protobuf;
 
+import org.apache.paimon.schema.ColumnIdentityMarker;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -81,7 +82,13 @@ public class ProtobufSchemaConverter implements Serializable {
     private static final String WRAPPER_SUFFIX = "Value";
     private static final String WRAPPER_FIELD = "value";
 
+    /** Scheme of the identity marker appended to every column description. */
+    public static final String IDENTITY_SCHEME = "proto";
+
     private final boolean readDefaultValues;
+
+    /** Comment index for the descriptor being converted. Rebuilt on every {@link #toFields}. */
+    private transient ProtobufComments comments;
 
     public ProtobufSchemaConverter(boolean readDefaultValues) {
         this.readDefaultValues = readDefaultValues;
@@ -90,14 +97,25 @@ public class ProtobufSchemaConverter implements Serializable {
     // ---------------------------------------------------------------- schema
 
     public List<DataField> toFields(Descriptor descriptor) {
+        comments = new ProtobufComments();
         Set<String> visiting = new HashSet<>();
         visiting.add(descriptor.getFullName());
         List<DataField> fields = new ArrayList<>();
         int id = 0;
         for (FieldDescriptor field : descriptor.getFields()) {
-            fields.add(new DataField(id++, field.getName(), toType(field, visiting)));
+            fields.add(
+                    new DataField(id++, field.getName(), toType(field, visiting), describe(field)));
         }
         return fields;
+    }
+
+    /**
+     * The column description carries the field's documentation comment and a {@code [proto:N]}
+     * identity marker. The marker is what lets the sink recognise a renamed field.
+     */
+    private String describe(FieldDescriptor field) {
+        return ColumnIdentityMarker.withIdentity(
+                comments.commentOf(field), IDENTITY_SCHEME + ":" + field.getNumber());
     }
 
     private DataType toType(FieldDescriptor field, Set<String> visiting) {
@@ -165,7 +183,7 @@ public class ProtobufSchemaConverter implements Serializable {
         try {
             RowType.Builder builder = RowType.builder();
             for (FieldDescriptor field : message.getFields()) {
-                builder.field(field.getName(), toType(field, visiting));
+                builder.field(field.getName(), toType(field, visiting), describe(field));
             }
             return builder.build();
         } finally {

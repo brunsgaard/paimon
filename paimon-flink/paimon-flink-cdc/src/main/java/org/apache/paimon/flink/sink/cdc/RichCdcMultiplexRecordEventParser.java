@@ -50,6 +50,7 @@ public class RichCdcMultiplexRecordEventParser implements EventParser<RichCdcMul
     @Nullable private final Pattern dbIncludingPattern;
     @Nullable private final Pattern dbExcludingPattern;
     private final TableNameConverter tableNameConverter;
+    private boolean completeSchema = false;
     private final Set<String> createdTables = new HashSet<>();
 
     private final Map<String, RichEventParser> parsers = new HashMap<>();
@@ -66,7 +67,12 @@ public class RichCdcMultiplexRecordEventParser implements EventParser<RichCdcMul
     private RichEventParser currentParser;
 
     public RichCdcMultiplexRecordEventParser(boolean caseSensitive) {
+        this(caseSensitive, false);
+    }
+
+    public RichCdcMultiplexRecordEventParser(boolean caseSensitive, boolean completeSchema) {
         this(null, null, null, null, null, new TableNameConverter(caseSensitive));
+        this.completeSchema = completeSchema;
     }
 
     public RichCdcMultiplexRecordEventParser(
@@ -91,7 +97,8 @@ public class RichCdcMultiplexRecordEventParser implements EventParser<RichCdcMul
         this.currentDb = record.databaseName();
         this.shouldSynchronizeCurrentTable = shouldSynchronizeCurrentTable();
         if (shouldSynchronizeCurrentTable) {
-            this.currentParser = parsers.computeIfAbsent(currentTable, t -> new RichEventParser());
+            this.currentParser =
+                    parsers.computeIfAbsent(currentTable, t -> new RichEventParser(completeSchema));
             this.currentParser.setRawEvent(record.toRichCdcRecord());
         }
     }

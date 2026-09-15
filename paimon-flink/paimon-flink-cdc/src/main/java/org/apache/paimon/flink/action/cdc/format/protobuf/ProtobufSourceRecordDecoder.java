@@ -18,8 +18,6 @@
 
 package org.apache.paimon.flink.action.cdc.format.protobuf;
 
-import org.apache.paimon.types.DataField;
-
 import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.DynamicMessage;
 import org.apache.flink.configuration.ConfigOption;
@@ -28,7 +26,6 @@ import org.apache.flink.configuration.Configuration;
 import java.io.IOException;
 import java.io.Serializable;
 import java.time.Duration;
-import java.util.List;
 
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.DESCRIPTOR_SET_PATH;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.DESCRIPTOR_SET_REFRESH_INTERVAL;
@@ -53,7 +50,7 @@ public class ProtobufSourceRecordDecoder implements Serializable {
     private transient ProtobufDescriptorProvider descriptorProvider;
     private transient ProtobufSchemaConverter converter;
     private transient Descriptor fieldsDescriptor;
-    private transient List<DataField> fields;
+    private transient byte[] schema;
 
     public ProtobufSourceRecordDecoder(Configuration config) {
         this.descriptorSetPath = required(config, DESCRIPTOR_SET_PATH);
@@ -82,15 +79,15 @@ public class ProtobufSourceRecordDecoder implements Serializable {
         }
         Descriptor descriptor = descriptorProvider.descriptor();
         DynamicMessage message = DynamicMessage.parseFrom(descriptor, bytes);
-        return new ProtobufSourceRecord(fieldsFor(descriptor), converter.toValues(message));
+        return new ProtobufSourceRecord(schemaFor(descriptor), converter.toValues(message));
     }
 
-    /** Field derivation is cached per descriptor instance, so a reload is what invalidates it. */
-    private List<DataField> fieldsFor(Descriptor descriptor) {
+    /** Schema derivation is cached per descriptor instance, so a reload is what invalidates it. */
+    private byte[] schemaFor(Descriptor descriptor) {
         if (descriptor != fieldsDescriptor) {
-            fields = converter.toFields(descriptor);
+            schema = ProtobufSourceRecord.serialize(converter.toFields(descriptor));
             fieldsDescriptor = descriptor;
         }
-        return fields;
+        return schema;
     }
 }

@@ -19,15 +19,24 @@
 package org.apache.paimon.flink.sink.cdc;
 
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypeRoot;
+import org.apache.paimon.types.MapType;
+import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.TypeUtils;
+
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -100,6 +109,15 @@ public class CdcRecordUtils {
             }
 
             DataType type = dataFields.get(idx).type();
+            if (hasUnknownNestedKeys(value, type)) {
+                // A field inside a ROW that the writer's schema does not have yet. The cast would
+                // silently drop it, so wait for the schema change like a new top-level column.
+                LOG.info(
+                        "Field '{}' has nested keys missing from {}. Waiting for schema update.",
+                        key,
+                        type);
+                return Optional.empty();
+            }
             try {
                 genericRow.setField(idx, TypeUtils.castFromCdcValueString(value, type));
             } catch (Exception e) {
@@ -125,5 +143,92 @@ public class CdcRecordUtils {
         }
 
         return new CdcRecord(row.getRowKind(), data);
+    }
+
+    /**
+     * True when a JSON value carries an object key that the ROW type, nested at any depth, lacks.
+     */
+    static boolean hasUnknownNestedKeys(String value, DataType type) {
+        if (!containsRow(type)) {
+            return false;
+        }
+        try {
+            return hasUnknownKeys(TypeUtils.OBJECT_MAPPER.readTree(value), type);
+        } catch (Exception e) {
+            // not JSON; let the cast report the problem
+            return false;
+        }
+    }
+
+    private static boolean containsRow(DataType type) {
+        switch (type.getTypeRoot()) {
+            case ROW:
+                return true;
+            case ARRAY:
+                return containsRow(((ArrayType) type).getElementType());
+            case MULTISET:
+                return containsRow(((MultisetType) type).getElementType());
+            case MAP:
+                return containsRow(((MapType) type).getValueType());
+            default:
+                return false;
+        }
+    }
+
+    private static boolean hasUnknownKeys(JsonNode node, DataType type) throws IOException {
+        if (node == null || node.isNull()) {
+            return false;
+        }
+        if (node.isTextual() && containsRow(type)) {
+            // some formats carry nested values as JSON text
+            node = TypeUtils.OBJECT_MAPPER.readTree(node.asText());
+        }
+        switch (type.getTypeRoot()) {
+            case ROW:
+                if (!node.isObject()) {
+                    return false;
+                }
+                RowType rowType = (RowType) type;
+                Iterator<String> names = node.fieldNames();
+                while (names.hasNext()) {
+                    String name = names.next();
+                    if (!rowType.containsField(name)) {
+                        return true;
+                    }
+                    if (hasUnknownKeys(node.get(name), rowType.getField(name).type())) {
+                        return true;
+                    }
+                }
+                return false;
+            case ARRAY:
+            case MULTISET:
+                if (!node.isArray()) {
+                    return false;
+                }
+                DataType elementType =
+                        type.getTypeRoot() == DataTypeRoot.ARRAY
+                                ? ((ArrayType) type).getElementType()
+                                : ((MultisetType) type).getElementType();
+                for (JsonNode element : node) {
+                    if (hasUnknownKeys(element, elementType)) {
+                        return true;
+                    }
+                }
+                return false;
+            case MAP:
+                if (!node.isObject()) {
+                    return false;
+                }
+                DataType valueType = ((MapType) type).getValueType();
+                Iterator<JsonNode> values = node.elements();
+                while (values.hasNext()) {
+                    if (hasUnknownKeys(values.next(), valueType)) {
+                        return true;
+                    }
+                }
+                return false;
+            default:
+                return false;
+        }
     }
 }

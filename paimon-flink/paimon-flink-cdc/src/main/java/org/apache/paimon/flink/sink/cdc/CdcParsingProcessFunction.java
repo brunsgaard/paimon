@@ -18,8 +18,9 @@
 
 package org.apache.paimon.flink.sink.cdc;
 
+import org.apache.paimon.flink.utils.JavaTypeInfo;
+
 import org.apache.flink.api.common.functions.OpenContext;
-import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.util.Collector;
@@ -37,7 +38,9 @@ import org.apache.flink.util.OutputTag;
 public class CdcParsingProcessFunction<T> extends ProcessFunction<T, CdcRecord> {
 
     public static final OutputTag<CdcSchema> SCHEMA_CHANGE_OUTPUT_TAG =
-            new OutputTag<>("table-schema-change", TypeInformation.of(CdcSchema.class));
+            // Java serialization: a CdcSchema may hold a ROW type, whose unmodifiable field list
+            // Kryo cannot rebuild.
+            new OutputTag<>("table-schema-change", new JavaTypeInfo<>(CdcSchema.class));
 
     private final EventParser.Factory<T> parserFactory;
 

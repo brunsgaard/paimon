@@ -21,6 +21,7 @@ package org.apache.paimon.flink.action.cdc;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.action.MultiTablesSinkMode;
 import org.apache.paimon.flink.sink.cdc.UpdatedDataFieldsProcessFunction;
+import org.apache.paimon.schema.ColumnIdentityMarker;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.types.DataField;
@@ -35,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -77,7 +79,12 @@ public class CdcActionCommonUtils {
 
     public static void assertSchemaCompatible(
             TableSchema paimonSchema, List<DataField> sourceTableFields) {
-        if (!schemaCompatible(paimonSchema, sourceTableFields)) {
+        assertSchemaCompatible(paimonSchema, sourceTableFields, false);
+    }
+
+    public static void assertSchemaCompatible(
+            TableSchema paimonSchema, List<DataField> sourceTableFields, boolean matchByIdentity) {
+        if (!schemaCompatible(paimonSchema, sourceTableFields, matchByIdentity)) {
             throw new IllegalArgumentException(
                     "Paimon schema and source table schema are not compatible.\n"
                             + "Paimon fields are: "
@@ -89,8 +96,27 @@ public class CdcActionCommonUtils {
 
     public static boolean schemaCompatible(
             TableSchema paimonSchema, List<DataField> sourceTableFields) {
+        return schemaCompatible(paimonSchema, sourceTableFields, false);
+    }
+
+    /**
+     * With {@code matchByIdentity}, a source field whose name is unknown is matched to the Paimon
+     * column that carries the same identity marker in its comment. That is a rename the sink will
+     * apply once the job runs, so it must not fail the startup check.
+     */
+    public static boolean schemaCompatible(
+            TableSchema paimonSchema, List<DataField> sourceTableFields, boolean matchByIdentity) {
         for (DataField field : sourceTableFields) {
             int idx = paimonSchema.fieldNames().indexOf(field.name());
+            if (idx < 0 && matchByIdentity) {
+                idx = indexByIdentity(paimonSchema, field);
+                if (idx >= 0) {
+                    LOG.info(
+                            "Field '{}' matches Paimon column '{}' by identity; it will be renamed.",
+                            field.name(),
+                            paimonSchema.fieldNames().get(idx));
+                }
+            }
             if (idx < 0) {
                 LOG.info("Cannot find field '{}' in Paimon table.", field.name());
                 return false;
@@ -113,6 +139,20 @@ public class CdcActionCommonUtils {
             }
         }
         return true;
+    }
+
+    private static int indexByIdentity(TableSchema paimonSchema, DataField field) {
+        Optional<String> identity = ColumnIdentityMarker.identityOf(field.description());
+        if (!identity.isPresent()) {
+            return -1;
+        }
+        List<DataField> fields = paimonSchema.fields();
+        for (int i = 0; i < fields.size(); i++) {
+            if (identity.equals(ColumnIdentityMarker.identityOf(fields.get(i).description()))) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     public static List<String> listCaseConvert(List<String> origin, boolean caseSensitive) {
