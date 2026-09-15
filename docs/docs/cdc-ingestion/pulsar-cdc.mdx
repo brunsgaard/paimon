@@ -54,6 +54,7 @@ and delete events from the message value. Plain JSON represents insert-only data
 | `maxwell-json` | Maxwell JSON change events |
 | `ogg-json` | Oracle GoldenGate JSON change events |
 | `json` | Plain JSON records, treated as inserts |
+| `protobuf` | Protobuf records decoded with a descriptor set, treated as inserts; set `protobuf.descriptor-set.path` and `protobuf.message-name` (see [Kafka CDC](./kafka-cdc)) |
 
 Check the event metadata before choosing a synchronization mode:
 

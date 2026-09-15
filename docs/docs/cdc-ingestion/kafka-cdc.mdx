@@ -56,6 +56,7 @@ and delete events from the message value. Plain JSON represents insert-only data
 | `json` | Plain JSON records, treated as inserts |
 | `aws-dms-json` | AWS Database Migration Service change events |
 | `debezium-bson` | [MongoDB events captured by Debezium](./kafka-debezium-bson) |
+| `protobuf` | Protobuf records decoded with a descriptor set, treated as inserts; set `protobuf.descriptor-set.path` and `protobuf.message-name` |
 
 Check the event metadata before choosing a synchronization mode:
 
@@ -126,6 +127,47 @@ Use `value.format=json` for records such as logs that contain only inserts. This
     --catalog_conf uri=thrift://hive-metastore:9083 \
     --table_conf sink.parallelism=4
 ```
+
+### Example: ingest protobuf
+
+Use `value.format=protobuf` for records encoded with Protocol Buffers. The format needs no
+generated classes. Point it at a serialized `FileDescriptorSet` and name the message type. Produce
+the set with `protoc --descriptor_set_out=events.desc --include_imports events.proto` and put it
+where the Flink cluster can read it.
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    kafka_sync_table \
+    --warehouse hdfs:///path/to/warehouse \
+    --database test_db \
+    --table purchases \
+    --kafka_conf properties.bootstrap.servers=127.0.0.1:9020 \
+    --kafka_conf topic=purchases \
+    --kafka_conf properties.group.id=123456 \
+    --kafka_conf value.format=protobuf \
+    --kafka_conf protobuf.descriptor-set.path=s3://schemas/purchases.desc \
+    --kafka_conf protobuf.message-name=com.example.Purchase \
+    --kafka_conf protobuf.descriptor-set.refresh-interval=60s \
+    --catalog_conf metastore=hive \
+    --catalog_conf uri=thrift://hive-metastore:9083 \
+    --table_conf sink.parallelism=4
+```
+
+Column types follow the message. Integers map to `INT` or `BIGINT`, `uint64` to `DECIMAL(20, 0)`,
+`bytes` to `STRING` holding base64, enums to `STRING` holding the value name,
+`google.protobuf.Timestamp` to `TIMESTAMP(6)` in UTC, nested messages to `ROW`, repeated fields to
+`ARRAY` and map fields to `MAP`. Unset fields are `NULL` unless `protobuf.read-default-values` is
+true.
+
+When producers add fields to the message, publish the new descriptor set to the same path. With a
+refresh interval set, the job picks it up and the schema evolution of the sink adds the columns.
+Records written before the change hold `NULL` in the new columns. Records that already carry a
+field the table does not have yet are written without it until the descriptor set is refreshed.
+
+For `kafka_sync_database`, the format uses the topic name as both database and table name, because
+protobuf messages carry neither. Rename targets with `--table_mapping`, `--table_prefix` or
+`--table_suffix`.
 
 ### Table Action Reference
 
@@ -233,11 +275,15 @@ Command syntax (square brackets indicate optional arguments):
 
 ## Additional Kafka Configuration {#additional-kafka_config}
 
-Pass this option through `--kafka_conf` in addition to the source connection settings:
+Pass these options through `--kafka_conf` in addition to the source connection settings:
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `schema.registry.url` | None | Confluent schema registry URL, required for `value.format=debezium-avro`. |
+| `protobuf.descriptor-set.path` | None | Path to a serialized `FileDescriptorSet`, required for `value.format=protobuf`. Any file system Flink supports, for example `file:///`, `s3://` or `gs://`. |
+| `protobuf.message-name` | None | Fully qualified message name, required for `value.format=protobuf`. |
+| `protobuf.descriptor-set.refresh-interval` | 0 | How often to check the descriptor set for changes. Zero disables the check. |
+| `protobuf.read-default-values` | false | Emit protobuf default values for unset fields instead of `NULL`. |
 
 ## Debezium-bson
 
