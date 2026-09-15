@@ -23,6 +23,7 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.action.Action;
+import org.apache.paimon.flink.sink.cdc.CdcSchemaEvolutionOptions;
 import org.apache.paimon.flink.sink.cdc.CdcSinkBuilder;
 import org.apache.paimon.flink.sink.cdc.EventParser;
 import org.apache.paimon.flink.sink.cdc.RichCdcMultiplexRecord;
@@ -123,7 +124,10 @@ public abstract class SyncTableActionBase extends SynchronizationActionBase {
                 computedColumns =
                         buildComputedColumns(computedColumnArgs, retrievedSchema.fields());
                 Schema paimonSchema = buildPaimonSchema(retrievedSchema);
-                assertSchemaCompatible(fileStoreTable.schema(), paimonSchema.fields());
+                assertSchemaCompatible(
+                        fileStoreTable.schema(),
+                        paimonSchema.fields(),
+                        schemaEvolutionOptions().renameByComment());
             } catch (SchemaRetrievalException e) {
                 LOG.info(
                         "Failed to retrieve schema from record data but there exists specified Paimon table. "
@@ -156,7 +160,29 @@ public abstract class SyncTableActionBase extends SynchronizationActionBase {
     @Override
     protected EventParser.Factory<RichCdcMultiplexRecord> buildEventParserFactory() {
         boolean caseSensitive = this.caseSensitive;
-        return () -> new RichCdcMultiplexRecordEventParser(caseSensitive);
+        CdcSchemaEvolutionOptions evolution = schemaEvolutionOptions();
+        if (evolution.dropMissingColumns() && !sourceProvidesCompleteSchema()) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "%s=true needs a source format that provides the complete schema with "
+                                    + "every record, such as protobuf.",
+                            CdcSchemaEvolutionOptions.DROP_MISSING_COLUMNS.key()));
+        }
+        boolean completeSchema = evolution.needsCompleteSchema();
+        return () -> new RichCdcMultiplexRecordEventParser(caseSensitive, completeSchema);
+    }
+
+    protected CdcSchemaEvolutionOptions schemaEvolutionOptions() {
+        return CdcSchemaEvolutionOptions.from(fileStoreTable.coreOptions().toConfiguration());
+    }
+
+    private boolean sourceProvidesCompleteSchema() {
+        try {
+            return syncJobHandler.provideDataFormat().providesCompleteSchema();
+        } catch (RuntimeException e) {
+            // sources without a message-queue data format, such as databases
+            return false;
+        }
     }
 
     @Override

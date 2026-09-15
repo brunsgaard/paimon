@@ -23,6 +23,7 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.FieldIdentifier;
 
@@ -54,7 +55,21 @@ public class UpdatedDataFieldsProcessFunction
             Identifier identifier,
             CatalogLoader catalogLoader,
             TypeMapping typeMapping) {
-        super(catalogLoader, typeMapping);
+        this(
+                schemaManager,
+                identifier,
+                catalogLoader,
+                typeMapping,
+                CdcSchemaEvolutionOptions.disabled());
+    }
+
+    public UpdatedDataFieldsProcessFunction(
+            SchemaManager schemaManager,
+            Identifier identifier,
+            CatalogLoader catalogLoader,
+            TypeMapping typeMapping,
+            CdcSchemaEvolutionOptions evolution) {
+        super(catalogLoader, typeMapping, evolution);
         this.schemaManager = schemaManager;
         this.identifier = identifier;
         this.latestFields = new HashSet<>();
@@ -63,19 +78,46 @@ public class UpdatedDataFieldsProcessFunction
     @Override
     public void processElement(CdcSchema updatedSchema, Context context, Collector<Void> collector)
             throws Exception {
+        if (evolution().renameByComment()) {
+            TableSchema latest = schemaManager.latest().get();
+            Set<String> protectedNames = new HashSet<>(latest.partitionKeys());
+            protectedNames.addAll(latest.primaryKeys());
+            List<SchemaChange> renames =
+                    detectRenames(
+                            latest.fields(),
+                            updatedSchema.fields(),
+                            protectedNames,
+                            typeMapping(),
+                            caseSensitive());
+            for (SchemaChange rename : renames) {
+                applySchemaChange(schemaManager, rename, identifier, updatedSchema);
+            }
+            if (!renames.isEmpty()) {
+                latestFields = updateLatestFields(schemaManager);
+            }
+        }
+
         List<DataField> actualUpdatedDataFields =
                 actualUpdatedDataFields(updatedSchema.fields(), latestFields);
-        if (actualUpdatedDataFields.isEmpty() && updatedSchema.comment() == null) {
-            return;
+        if (!actualUpdatedDataFields.isEmpty() || updatedSchema.comment() != null) {
+            CdcSchema actualUpdatedSchema =
+                    new CdcSchema(
+                            actualUpdatedDataFields,
+                            updatedSchema.primaryKeys(),
+                            updatedSchema.comment());
+            for (SchemaChange schemaChange :
+                    extractSchemaChanges(schemaManager, actualUpdatedSchema)) {
+                applySchemaChange(schemaManager, schemaChange, identifier, actualUpdatedSchema);
+            }
         }
-        CdcSchema actualUpdatedSchema =
-                new CdcSchema(
-                        actualUpdatedDataFields,
-                        updatedSchema.primaryKeys(),
-                        updatedSchema.comment());
-        for (SchemaChange schemaChange : extractSchemaChanges(schemaManager, actualUpdatedSchema)) {
-            applySchemaChange(schemaManager, schemaChange, identifier, actualUpdatedSchema);
+
+        if (evolution().dropMissingColumns()) {
+            TableSchema latest = schemaManager.latest().get();
+            for (SchemaChange drop : detectDrops(latest, updatedSchema.fields(), caseSensitive())) {
+                applySchemaChange(schemaManager, drop, identifier, updatedSchema);
+            }
         }
+
         /*
          * Here, actualUpdatedDataFields cannot be used to update latestFields because there is a
          * non-SchemaChange.AddColumn scenario. Otherwise, the previously existing fields cannot be

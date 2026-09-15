@@ -906,4 +906,97 @@ public class NestedSchemaUtilsTest {
         assertThat(addColumn).isNotNull();
         assertThat(addColumn.fieldNames()).containsExactly("multiset_column", "element", "name");
     }
+
+    // ---------------------------------------------------------------- identity-aware updates
+
+    private static java.util.Optional<String> identity(String description) {
+        return ColumnIdentityMarker.identityOf(description);
+    }
+
+    @Test
+    public void testNestedRenameByIdentityComesBeforeUpdates() {
+        RowType oldType =
+                RowType.builder()
+                        .field("city", DataTypes.STRING(), "[proto:1]")
+                        .field("zip", DataTypes.INT(), "[proto:2]")
+                        .build();
+        RowType newType =
+                RowType.builder()
+                        .field("city", DataTypes.STRING(), "[proto:1]")
+                        .field("postal", DataTypes.BIGINT(), "[proto:2]")
+                        .build();
+
+        List<SchemaChange> changes = new ArrayList<>();
+        NestedSchemaUtils.generateNestedColumnUpdates(
+                Collections.singletonList("address"),
+                oldType,
+                newType,
+                changes,
+                NestedSchemaUtilsTest::identity,
+                true);
+
+        assertThat(changes).hasSize(2);
+        SchemaChange.RenameColumn rename = (SchemaChange.RenameColumn) changes.get(0);
+        assertThat(rename.fieldNames()).containsExactly("address", "zip");
+        assertThat(rename.newName()).isEqualTo("postal");
+        // the widening is applied under the new name
+        SchemaChange.UpdateColumnType widen = (SchemaChange.UpdateColumnType) changes.get(1);
+        assertThat(widen.fieldNames()).containsExactly("address", "postal");
+        assertThat(widen.newDataType()).isEqualTo(DataTypes.BIGINT());
+    }
+
+    @Test
+    public void testNestedDropOnlyWhenEnabledAndAfterAdds() {
+        RowType oldType =
+                RowType.builder()
+                        .field("city", DataTypes.STRING(), "[proto:1]")
+                        .field("zip", DataTypes.STRING(), "[proto:2]")
+                        .build();
+        RowType newType =
+                RowType.builder()
+                        .field("city", DataTypes.STRING(), "[proto:1]")
+                        .field("street", DataTypes.STRING(), "[proto:3]")
+                        .build();
+
+        List<SchemaChange> enabled = new ArrayList<>();
+        NestedSchemaUtils.generateNestedColumnUpdates(
+                Collections.singletonList("address"),
+                oldType,
+                newType,
+                enabled,
+                NestedSchemaUtilsTest::identity,
+                true);
+        assertThat(enabled).hasSize(2);
+        assertThat(enabled.get(0)).isInstanceOf(SchemaChange.AddColumn.class);
+        assertThat(enabled.get(1)).isInstanceOf(SchemaChange.DropColumn.class);
+        assertThat(((SchemaChange.DropColumn) enabled.get(1)).fieldNames())
+                .containsExactly("address", "zip");
+
+        List<SchemaChange> disabled = new ArrayList<>();
+        NestedSchemaUtils.generateNestedColumnUpdates(
+                Collections.singletonList("address"),
+                oldType,
+                newType,
+                disabled,
+                NestedSchemaUtilsTest::identity,
+                false);
+        assertThat(disabled).hasSize(1);
+        assertThat(disabled.get(0)).isInstanceOf(SchemaChange.AddColumn.class);
+    }
+
+    @Test
+    public void testLegacyEntryPointStillDrops() {
+        RowType oldType =
+                RowType.builder()
+                        .field("a", DataTypes.STRING())
+                        .field("b", DataTypes.STRING())
+                        .build();
+        RowType newType = RowType.builder().field("a", DataTypes.STRING()).build();
+
+        List<SchemaChange> changes = new ArrayList<>();
+        NestedSchemaUtils.generateNestedColumnUpdates(
+                Collections.singletonList("r"), oldType, newType, changes);
+        assertThat(changes).hasSize(1);
+        assertThat(changes.get(0)).isInstanceOf(SchemaChange.DropColumn.class);
+    }
 }

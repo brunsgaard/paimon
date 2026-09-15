@@ -67,4 +67,13 @@ public interface DataFormat {
             Configuration cdcSourceConfig);
 
     DeserializationSchema<CdcSourceRecord> createPulsarDeserializer(Configuration cdcSourceConfig);
+
+    /**
+     * Whether every record's schema is the complete source schema, derived from a descriptor rather
+     * than from the fields present in that record. Required by {@code
+     * cdc.schema-evolution.drop-missing-columns}.
+     */
+    default boolean providesCompleteSchema() {
+        return false;
+    }
 }

@@ -19,6 +19,8 @@
 package org.apache.paimon.flink.sink.cdc;
 
 import org.apache.paimon.flink.action.cdc.TypeMapping;
+import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataField;
@@ -36,6 +38,9 @@ import org.apache.paimon.types.VarCharType;
 import org.junit.Test;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -634,5 +639,180 @@ public class UpdatedDataFieldsProcessFunctionBaseTest {
                 UpdatedDataFieldsProcessFunctionBase.canConvert(
                         oldType, newType, TypeMapping.defaultMapping());
         assertEquals(UpdatedDataFieldsProcessFunctionBase.ConvertAction.EXCEPTION, convertAction);
+    }
+
+    // ---------------------------------------------------------------- rename detection
+
+    private static DataField field(
+            int id, String name, org.apache.paimon.types.DataType type, String description) {
+        return new DataField(id, name, type, description);
+    }
+
+    @Test
+    public void testDetectRenamesMatchesByIdentity() {
+        List<DataField> table =
+                Arrays.asList(
+                        field(0, "id", DataTypes.BIGINT(), "[proto:1]"),
+                        field(1, "name", DataTypes.STRING(), "Display name. [proto:2]"));
+        List<DataField> record =
+                Arrays.asList(
+                        field(0, "id", DataTypes.BIGINT(), "[proto:1]"),
+                        field(1, "title", DataTypes.STRING(), "Display name. [proto:2]"));
+
+        List<SchemaChange> renames =
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                        table, record, Collections.emptySet(), TypeMapping.defaultMapping(), true);
+
+        assertEquals(1, renames.size());
+        SchemaChange.RenameColumn rename = (SchemaChange.RenameColumn) renames.get(0);
+        assertEquals("name", rename.fieldNames()[0]);
+        assertEquals("title", rename.newName());
+    }
+
+    @Test
+    public void testDetectRenamesAllowsWidening() {
+        List<DataField> table =
+                Collections.singletonList(field(0, "attempt", DataTypes.INT(), "[proto:201]"));
+        List<DataField> record =
+                Collections.singletonList(field(0, "tries", DataTypes.BIGINT(), "[proto:201]"));
+
+        assertEquals(
+                1,
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                                table,
+                                record,
+                                Collections.emptySet(),
+                                TypeMapping.defaultMapping(),
+                                true)
+                        .size());
+    }
+
+    @Test
+    public void testDetectRenamesFallsBackOnIncompatibleTypeAmbiguityAndProtectedColumns() {
+        // incompatible type: STRING -> BIGINT
+        List<DataField> table =
+                Collections.singletonList(field(0, "spend", DataTypes.STRING(), "[proto:8]"));
+        List<DataField> record =
+                Collections.singletonList(field(0, "amount", DataTypes.BIGINT(), "[proto:8]"));
+        assertEquals(
+                0,
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                                table,
+                                record,
+                                Collections.emptySet(),
+                                TypeMapping.defaultMapping(),
+                                true)
+                        .size());
+
+        // ambiguous: two vanished columns share the identity
+        table =
+                Arrays.asList(
+                        field(0, "a", DataTypes.STRING(), "[proto:5]"),
+                        field(1, "b", DataTypes.STRING(), "[proto:5]"));
+        record = Collections.singletonList(field(0, "c", DataTypes.STRING(), "[proto:5]"));
+        assertEquals(
+                0,
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                                table,
+                                record,
+                                Collections.emptySet(),
+                                TypeMapping.defaultMapping(),
+                                true)
+                        .size());
+
+        // protected: partition key
+        table = Collections.singletonList(field(0, "dt", DataTypes.STRING(), "[proto:9]"));
+        record = Collections.singletonList(field(0, "day", DataTypes.STRING(), "[proto:9]"));
+        assertEquals(
+                0,
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                                table,
+                                record,
+                                new java.util.HashSet<>(Collections.singletonList("dt")),
+                                TypeMapping.defaultMapping(),
+                                true)
+                        .size());
+
+        // no marker on the old column: nothing to match
+        table = Collections.singletonList(field(0, "name", DataTypes.STRING(), null));
+        record = Collections.singletonList(field(0, "title", DataTypes.STRING(), "[proto:2]"));
+        assertEquals(
+                0,
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                                table,
+                                record,
+                                Collections.emptySet(),
+                                TypeMapping.defaultMapping(),
+                                true)
+                        .size());
+    }
+
+    @Test
+    public void testDetectRenamesIgnoresSwaps() {
+        List<DataField> table =
+                Arrays.asList(
+                        field(0, "a", DataTypes.STRING(), "[proto:1]"),
+                        field(1, "b", DataTypes.STRING(), "[proto:2]"));
+        List<DataField> record =
+                Arrays.asList(
+                        field(0, "b", DataTypes.STRING(), "[proto:1]"),
+                        field(1, "a", DataTypes.STRING(), "[proto:2]"));
+        // both names still exist, so neither is new; nothing to rename
+        assertEquals(
+                0,
+                UpdatedDataFieldsProcessFunctionBase.detectRenames(
+                                table,
+                                record,
+                                Collections.emptySet(),
+                                TypeMapping.defaultMapping(),
+                                true)
+                        .size());
+    }
+
+    // ---------------------------------------------------------------- drop detection
+
+    private static TableSchema schema(List<DataField> fields, List<String> partitionKeys) {
+        return new TableSchema(
+                0,
+                fields,
+                fields.size(),
+                partitionKeys,
+                Collections.emptyList(),
+                new HashMap<>(),
+                null);
+    }
+
+    @Test
+    public void testDetectDropsOnlyMarkedMissingColumns() {
+        TableSchema table =
+                schema(
+                        Arrays.asList(
+                                field(0, "id", DataTypes.BIGINT(), "[proto:1]"),
+                                field(1, "dsp", DataTypes.STRING(), "[proto:2]"),
+                                field(2, "partition_date", DataTypes.STRING(), null),
+                                field(3, "dt", DataTypes.STRING(), "[proto:9]")),
+                        Collections.singletonList("dt"));
+        List<DataField> record =
+                Collections.singletonList(field(0, "id", DataTypes.BIGINT(), "[proto:1]"));
+
+        List<SchemaChange> drops =
+                UpdatedDataFieldsProcessFunctionBase.detectDrops(table, record, true);
+
+        // dsp is dropped; partition_date has no marker; dt is a partition key
+        assertEquals(1, drops.size());
+        assertEquals("dsp", ((SchemaChange.DropColumn) drops.get(0)).fieldNames()[0]);
+    }
+
+    @Test
+    public void testDetectDropsNeverEmptiesTheTable() {
+        TableSchema table =
+                schema(
+                        Collections.singletonList(field(0, "id", DataTypes.BIGINT(), "[proto:1]")),
+                        Collections.emptyList());
+        assertEquals(
+                0,
+                UpdatedDataFieldsProcessFunctionBase.detectDrops(
+                                table, Collections.emptyList(), true)
+                        .size());
     }
 }

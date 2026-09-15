@@ -33,6 +33,21 @@ public class RichEventParser implements EventParser<RichCdcRecord> {
 
     private String previousComment;
 
+    /**
+     * When true, any change makes the parser emit the whole record schema, and a field that
+     * disappears from the record counts as a change. The sink needs the complete schema to detect
+     * renamed and dropped columns.
+     */
+    private final boolean completeSchema;
+
+    public RichEventParser() {
+        this(false);
+    }
+
+    public RichEventParser(boolean completeSchema) {
+        this.completeSchema = completeSchema;
+    }
+
     @Override
     public void setRawEvent(RichCdcRecord rawEvent) {
         this.record = rawEvent;
@@ -49,9 +64,24 @@ public class RichEventParser implements EventParser<RichCdcRecord> {
             // When the order of the same field is different, its ID may also be different,
             // so the comparison should not include the ID.
             if (!DataField.dataFieldEqualsIgnoreId(previous, dataField)) {
-                previousDataFields.put(dataField.name(), dataField);
-                change.column(dataField);
+                if (!completeSchema) {
+                    previousDataFields.put(dataField.name(), dataField);
+                    change.column(dataField);
+                }
                 hasChange = true;
+            }
+        }
+        if (completeSchema) {
+            if (!hasChange && previousDataFields.size() != recordedSchema.fields().size()) {
+                // a field was renamed or removed at the source
+                hasChange = true;
+            }
+            if (hasChange) {
+                previousDataFields.clear();
+                for (DataField dataField : recordedSchema.fields()) {
+                    previousDataFields.put(dataField.name(), dataField);
+                    change.column(dataField);
+                }
             }
         }
 

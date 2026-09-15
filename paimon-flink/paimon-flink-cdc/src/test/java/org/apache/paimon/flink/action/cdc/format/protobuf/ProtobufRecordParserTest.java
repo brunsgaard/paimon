@@ -89,6 +89,13 @@ public class ProtobufRecordParserTest {
         assertThat(types.get("ts")).isEqualTo(DataTypes.TIMESTAMP(6));
         assertThat(types.get("big")).isEqualTo(DataTypes.DECIMAL(20, 0));
         assertThat(types.get("tags")).isEqualTo(DataTypes.ARRAY(DataTypes.STRING()));
+        assertThat(
+                        schema.fields().stream()
+                                .filter(f -> f.name().equals("address"))
+                                .findFirst()
+                                .get()
+                                .description())
+                .isEqualTo(TestProtobufDescriptors.EVENT_ADDRESS_COMMENT + " [proto:7]");
     }
 
     @Test

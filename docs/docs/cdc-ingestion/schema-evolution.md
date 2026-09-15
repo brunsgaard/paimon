@@ -38,8 +38,8 @@ changes. It does not replicate every source DDL statement.
 | Widen a string or binary type | Increase the target length. |
 | Widen an integer or floating-point type | Widen within the corresponding type family, such as `INT` to `BIGINT` or `FLOAT` to `DOUBLE`. |
 | Change a non-string type to a string type | Requires `--type_mapping allow-non-string-to-string`; disabled by default. |
-| Drop a column | Keep the existing target column. |
-| Rename a column | Treat the new name as a new column; keep the old column. |
+| Drop a column | Keep the existing target column. With `cdc.schema-evolution.drop-missing-columns=true` and a format that marks columns with a source identity (protobuf), drop it. |
+| Rename a column | Treat the new name as a new column; keep the old column. With `cdc.schema-evolution.rename-by-comment=true` and a format that marks columns (protobuf), rename it and keep its history. |
 | Rename a table | Do not rename the existing Paimon table. Source selection and routing determine whether events for the new name are consumed. |
 
 The sink also handles decimal precision/scale changes, temporal precision changes, and compatible

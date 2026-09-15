@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.action.cdc.format.protobuf;
 
+import org.apache.paimon.schema.ColumnIdentityMarker;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -187,6 +188,48 @@ public class ProtobufSchemaConverterTest {
             throw new RuntimeException(e);
         }
         assertThat(converter.toValues(decoded)).doesNotContainKey("region").containsKey("id");
+    }
+
+    @Test
+    public void testDescriptionsCarryCommentAndFieldNumber() {
+        List<DataField> fields = new ProtobufSchemaConverter(false).toFields(EVENT_TYPE);
+        Map<String, String> descriptions =
+                fields.stream().collect(Collectors.toMap(DataField::name, DataField::description));
+
+        // no comment in the proto: just the identity marker
+        assertThat(descriptions.get("id")).isEqualTo("[proto:1]");
+        // a documented field keeps its comment ahead of the marker
+        assertThat(descriptions.get("address"))
+                .isEqualTo(TestProtobufDescriptors.EVENT_ADDRESS_COMMENT + " [proto:7]");
+        assertThat(descriptions.get("big")).isEqualTo("[proto:11]");
+
+        // nested ROW fields are marked too, with their own numbers and comments
+        RowType address =
+                (RowType)
+                        fields.stream()
+                                .filter(f -> f.name().equals("address"))
+                                .findFirst()
+                                .get()
+                                .type();
+        assertThat(address.getFields().get(0).description())
+                .isEqualTo(TestProtobufDescriptors.ADDRESS_CITY_COMMENT + " [proto:1]");
+        assertThat(address.getFields().get(1).description()).isEqualTo("[proto:2]");
+
+        // ARRAY<ROW> elements share the message type, so the same descriptions
+        RowType element =
+                (RowType)
+                        ((org.apache.paimon.types.ArrayType)
+                                        fields.stream()
+                                                .filter(f -> f.name().equals("addresses"))
+                                                .findFirst()
+                                                .get()
+                                                .type())
+                                .getElementType();
+        assertThat(element.getFields().get(0).description())
+                .isEqualTo(TestProtobufDescriptors.ADDRESS_CITY_COMMENT + " [proto:1]");
+
+        assertThat(ColumnIdentityMarker.identityOf(descriptions.get("address")))
+                .contains("proto:7");
     }
 
     private static Map<String, DataType> typesOf(List<DataField> fields) {

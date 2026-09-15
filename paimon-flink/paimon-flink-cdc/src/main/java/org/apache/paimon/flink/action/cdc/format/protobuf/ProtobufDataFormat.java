@@ -51,4 +51,10 @@ public class ProtobufDataFormat extends AbstractDataFormat {
     protected Function<Configuration, DeserializationSchema<CdcSourceRecord>> pulsarDeserializer() {
         return PulsarProtobufDeserializationSchema::new;
     }
+
+    /** The schema comes from the descriptor, so a missing field means the producer removed it. */
+    @Override
+    public boolean providesCompleteSchema() {
+        return true;
+    }
 }

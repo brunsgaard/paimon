@@ -125,7 +125,9 @@ public class CdcSinkBuilder<T> {
                                                 dataTable.fileIO(), dataTable.location()),
                                         identifier,
                                         catalogLoader,
-                                        typeMapping))
+                                        typeMapping,
+                                        CdcSchemaEvolutionOptions.from(
+                                                dataTable.coreOptions().toConfiguration())))
                         .name("Schema Evolution");
         schemaChangeProcessFunction.getTransformation().setParallelism(1);
         schemaChangeProcessFunction.getTransformation().setMaxParallelism(1);

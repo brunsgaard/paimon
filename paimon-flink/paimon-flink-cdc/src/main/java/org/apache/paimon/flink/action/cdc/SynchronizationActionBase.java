@@ -28,6 +28,7 @@ import org.apache.paimon.flink.action.cdc.watermark.CdcTimestampExtractor;
 import org.apache.paimon.flink.action.cdc.watermark.CdcWatermarkStrategy;
 import org.apache.paimon.flink.sink.cdc.EventParser;
 import org.apache.paimon.flink.sink.cdc.RichCdcMultiplexRecord;
+import org.apache.paimon.flink.utils.JavaTypeInfo;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
@@ -136,7 +137,12 @@ public abstract class SynchronizationActionBase extends ActionBase {
         beforeBuildingSourceSink();
 
         DataStream<RichCdcMultiplexRecord> input =
-                buildDataStreamSource(buildSource()).flatMap(recordParse()).name("Parse");
+                buildDataStreamSource(buildSource())
+                        .flatMap(recordParse())
+                        // Java serialization: the record schema may hold ROW types, whose
+                        // unmodifiable field lists Kryo cannot rebuild
+                        .returns(new JavaTypeInfo<>(RichCdcMultiplexRecord.class))
+                        .name("Parse");
 
         EventParser.Factory<RichCdcMultiplexRecord> parserFactory = buildEventParserFactory();
 
