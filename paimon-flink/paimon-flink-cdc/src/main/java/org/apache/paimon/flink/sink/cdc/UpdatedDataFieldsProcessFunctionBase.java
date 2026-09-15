@@ -18,10 +18,12 @@
 
 package org.apache.paimon.flink.sink.cdc;
 
+import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
+import org.apache.paimon.schema.ColumnIdentityMarker;
 import org.apache.paimon.schema.NestedSchemaUtils;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
@@ -47,9 +49,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /** Base class for update data fields process function. */
@@ -60,6 +65,7 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
 
     protected final CatalogLoader catalogLoader;
     private final TypeMapping typeMapping;
+    private final CdcSchemaEvolutionOptions evolution;
 
     protected Catalog catalog;
     private boolean caseSensitive;
@@ -87,8 +93,28 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
 
     protected UpdatedDataFieldsProcessFunctionBase(
             CatalogLoader catalogLoader, TypeMapping typeMapping) {
+        this(catalogLoader, typeMapping, CdcSchemaEvolutionOptions.disabled());
+    }
+
+    protected UpdatedDataFieldsProcessFunctionBase(
+            CatalogLoader catalogLoader,
+            TypeMapping typeMapping,
+            CdcSchemaEvolutionOptions evolution) {
         this.catalogLoader = catalogLoader;
         this.typeMapping = typeMapping;
+        this.evolution = evolution;
+    }
+
+    protected TypeMapping typeMapping() {
+        return typeMapping;
+    }
+
+    protected CdcSchemaEvolutionOptions evolution() {
+        return evolution;
+    }
+
+    protected boolean caseSensitive() {
+        return caseSensitive;
     }
 
     /**
@@ -155,6 +181,34 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
             catalog.alterTable(identifier, schemaChange, false);
         } else if (schemaChange instanceof SchemaChange.UpdateComment) {
             catalog.alterTable(identifier, schemaChange, false);
+        } else if (schemaChange instanceof SchemaChange.RenameColumn) {
+            try {
+                catalog.alterTable(identifier, schemaChange, false);
+            } catch (Catalog.ColumnAlreadyExistException | Catalog.ColumnNotExistException e) {
+                // another writer of the same table renamed it first
+                LOG.warn("Skipping {}, the table already reflects it", schemaChange, e);
+            }
+        } else if (schemaChange instanceof SchemaChange.DropColumn) {
+            if (!evolution.dropMissingColumns()) {
+                LOG.warn(
+                        "Ignoring {} on {}. Set {}=true to drop columns the source no longer has.",
+                        schemaChange,
+                        identifier.getFullName(),
+                        CdcSchemaEvolutionOptions.DROP_MISSING_COLUMNS.key());
+                return;
+            }
+            try {
+                catalog.alterTable(identifier, schemaChange, false);
+            } catch (Catalog.ColumnNotExistException e) {
+                LOG.debug("Column already dropped: {}", schemaChange, e);
+            } catch (UnsupportedOperationException | IllegalArgumentException e) {
+                // partition key, primary key or the last column of the table
+                LOG.warn(
+                        "Skipping {} on {}: {}",
+                        schemaChange,
+                        identifier.getFullName(),
+                        e.getMessage());
+            }
         } else {
             throw new UnsupportedOperationException(
                     "Unsupported schema change class "
@@ -397,11 +451,17 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
                         continue;
                     }
                     // Generate nested column updates if needed
+                    Function<String, Optional<String>> identityOf = null;
+                    if (evolution.renameByComment()) {
+                        identityOf = ColumnIdentityMarker::identityOf;
+                    }
                     NestedSchemaUtils.generateNestedColumnUpdates(
                             Collections.singletonList(newFieldName),
                             oldField.type(),
                             newField.type(),
-                            result);
+                            result,
+                            identityOf,
+                            evolution.dropMissingColumns());
                     // update column comment
                     if (newField.description() != null) {
                         result.add(
@@ -423,6 +483,124 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
             result.add(SchemaChange.updateComment(updatedSchema.comment()));
         }
         return result;
+    }
+
+    /**
+     * Finds source fields that are renamed columns rather than new ones. A rename is a field with
+     * an unknown name whose identity marker matches exactly one table column that the source no
+     * longer has, with a type the old column can convert to. Ambiguous matches and protected
+     * columns fall back to the regular add-column path.
+     */
+    @VisibleForTesting
+    public static List<SchemaChange> detectRenames(
+            List<DataField> tableFields,
+            List<DataField> recordFields,
+            Set<String> protectedNames,
+            TypeMapping typeMapping,
+            boolean caseSensitive) {
+        Map<String, DataField> oldByName = new HashMap<>();
+        for (DataField field : tableFields) {
+            oldByName.put(StringUtils.toLowerCaseIfNeed(field.name(), caseSensitive), field);
+        }
+        Set<String> newNames = new HashSet<>();
+        for (DataField field : recordFields) {
+            newNames.add(StringUtils.toLowerCaseIfNeed(field.name(), caseSensitive));
+        }
+        Map<String, List<DataField>> vanishedByIdentity = new HashMap<>();
+        for (DataField old : tableFields) {
+            if (newNames.contains(StringUtils.toLowerCaseIfNeed(old.name(), caseSensitive))) {
+                continue;
+            }
+            ColumnIdentityMarker.identityOf(old.description())
+                    .ifPresent(
+                            id ->
+                                    vanishedByIdentity
+                                            .computeIfAbsent(id, k -> new ArrayList<>())
+                                            .add(old));
+        }
+        List<SchemaChange> renames = new ArrayList<>();
+        for (DataField candidate : recordFields) {
+            String newName = StringUtils.toLowerCaseIfNeed(candidate.name(), caseSensitive);
+            if (oldByName.containsKey(newName)) {
+                continue;
+            }
+            Optional<String> identity = ColumnIdentityMarker.identityOf(candidate.description());
+            if (!identity.isPresent()) {
+                continue;
+            }
+            List<DataField> vanished = vanishedByIdentity.get(identity.get());
+            if (vanished == null || vanished.isEmpty()) {
+                continue;
+            }
+            if (vanished.size() > 1) {
+                LOG.warn(
+                        "Field {} matches identity {} of several vanished columns {}; adding it instead",
+                        candidate.name(),
+                        identity.get(),
+                        vanished);
+                continue;
+            }
+            DataField old = vanished.get(0);
+            if (protectedNames.contains(StringUtils.toLowerCaseIfNeed(old.name(), caseSensitive))) {
+                LOG.warn(
+                        "Not renaming protected column {} to {}; adding it instead",
+                        old.name(),
+                        candidate.name());
+                continue;
+            }
+            if (canConvert(old.type(), candidate.type(), typeMapping) == ConvertAction.EXCEPTION) {
+                LOG.warn(
+                        "Not renaming {} to {}: type {} cannot become {}; adding it instead",
+                        old.name(),
+                        candidate.name(),
+                        old.type(),
+                        candidate.type());
+                continue;
+            }
+            renames.add(SchemaChange.renameColumn(old.name(), newName));
+            vanishedByIdentity.remove(identity.get());
+        }
+        return renames;
+    }
+
+    /**
+     * Finds table columns the source no longer has. Only columns that carry an identity marker are
+     * dropped, so columns the sink did not derive from the source, such as computed or metadata
+     * columns, are never touched. Partition and primary keys are skipped, and the table is never
+     * emptied.
+     */
+    @VisibleForTesting
+    public static List<SchemaChange> detectDrops(
+            TableSchema tableSchema, List<DataField> recordFields, boolean caseSensitive) {
+        Set<String> present = new HashSet<>();
+        for (DataField field : recordFields) {
+            present.add(StringUtils.toLowerCaseIfNeed(field.name(), caseSensitive));
+        }
+        Set<String> protectedNames = new HashSet<>();
+        for (String key : tableSchema.partitionKeys()) {
+            protectedNames.add(StringUtils.toLowerCaseIfNeed(key, caseSensitive));
+        }
+        for (String key : tableSchema.primaryKeys()) {
+            protectedNames.add(StringUtils.toLowerCaseIfNeed(key, caseSensitive));
+        }
+        List<SchemaChange> drops = new ArrayList<>();
+        for (DataField old : tableSchema.fields()) {
+            String name = StringUtils.toLowerCaseIfNeed(old.name(), caseSensitive);
+            if (present.contains(name)
+                    || !ColumnIdentityMarker.identityOf(old.description()).isPresent()) {
+                continue;
+            }
+            if (protectedNames.contains(name)) {
+                LOG.warn("Not dropping protected column {}", old.name());
+                continue;
+            }
+            drops.add(SchemaChange.dropColumn(old.name()));
+        }
+        if (!drops.isEmpty() && drops.size() >= tableSchema.fields().size()) {
+            LOG.warn("Refusing to drop every column of the table; keeping {}", drops);
+            return Collections.emptyList();
+        }
+        return drops;
     }
 
     protected List<DataField> actualUpdatedDataFields(

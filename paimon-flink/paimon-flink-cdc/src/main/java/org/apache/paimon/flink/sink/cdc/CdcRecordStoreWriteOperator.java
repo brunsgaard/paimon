@@ -101,6 +101,21 @@ public class CdcRecordStoreWriteOperator extends TableWriteOperator<CdcRecord> {
         super.initializeState(context);
     }
 
+    /**
+     * Picks up schema changes that do not fail record conversion, such as a new or renamed field
+     * inside a ROW column. Without this the writer keeps its stale row type until the job restarts
+     * and silently writes NULL for the new nested field.
+     */
+    @Override
+    public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+        FileStoreTable latest = table.copyWithLatestSchema();
+        if (latest.schema().id() != table.schema().id()) {
+            table = latest;
+            write.replace(table);
+        }
+        super.prepareSnapshotPreBarrier(checkpointId);
+    }
+
     @Override
     public void processElement(StreamRecord<CdcRecord> element) throws Exception {
         CdcRecord record = element.getValue();

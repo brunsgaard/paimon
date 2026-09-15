@@ -19,9 +19,12 @@
 package org.apache.paimon.flink.action.cdc.format.protobuf;
 
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.utils.InstantiationUtil;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,23 +33,58 @@ import java.util.Objects;
 /**
  * A decoded protobuf message. The deserialization schema produces it and {@link
  * ProtobufRecordParser} consumes it. Values are already in the string form that the CDC sink
- * expects, and fields describe the message type the values were decoded with, so the record is
- * self-describing and plain Java serializable.
+ * expects, and the schema describes the message type the values were decoded with, so the record is
+ * self-describing.
+ *
+ * <p>The schema travels as Java-serialized bytes. Flink falls back to Kryo for this record, and
+ * Kryo cannot rebuild the unmodifiable lists inside Paimon's {@code RowType}. Records from one
+ * descriptor share one byte array, so a consumer can cache the parsed fields by comparing it.
  */
 public class ProtobufSourceRecord implements Serializable {
 
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
-    private final List<DataField> fields;
+    private final byte[] schema;
     private final Map<String, String> values;
 
+    private transient List<DataField> fields;
+
     public ProtobufSourceRecord(List<DataField> fields, Map<String, String> values) {
-        // Plain collections keep the record friendly to Flink's Kryo fallback serializer.
+        this(serialize(fields), values);
         this.fields = new ArrayList<>(fields);
+    }
+
+    public ProtobufSourceRecord(byte[] schema, Map<String, String> values) {
+        this.schema = schema;
         this.values = new LinkedHashMap<>(values);
     }
 
+    public static byte[] serialize(List<DataField> fields) {
+        try {
+            return InstantiationUtil.serializeObject(new ArrayList<>(fields));
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to serialize protobuf schema", e);
+        }
+    }
+
+    public static List<DataField> deserialize(byte[] schema) {
+        try {
+            return InstantiationUtil.deserializeObject(
+                    schema, ProtobufSourceRecord.class.getClassLoader());
+        } catch (IOException | ClassNotFoundException e) {
+            throw new IllegalStateException("Failed to deserialize protobuf schema", e);
+        }
+    }
+
+    /** The serialized schema. Identical bytes for every record decoded with one descriptor. */
+    public byte[] schemaBytes() {
+        return schema;
+    }
+
     public List<DataField> fields() {
+        if (fields == null) {
+            fields = deserialize(schema);
+        }
         return fields;
     }
 
@@ -61,12 +99,12 @@ public class ProtobufSourceRecord implements Serializable {
             return false;
         }
         ProtobufSourceRecord that = (ProtobufSourceRecord) o;
-        return fields.equals(that.fields) && values.equals(that.values);
+        return Arrays.equals(schema, that.schema) && values.equals(that.values);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(fields, values);
+        return Objects.hash(Arrays.hashCode(schema), values);
     }
 
     @Override

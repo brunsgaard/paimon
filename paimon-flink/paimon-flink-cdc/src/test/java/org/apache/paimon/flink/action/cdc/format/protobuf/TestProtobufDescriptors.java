@@ -29,15 +29,18 @@ import com.google.protobuf.DescriptorProtos.FileDescriptorProto;
 import com.google.protobuf.DescriptorProtos.FileDescriptorSet;
 import com.google.protobuf.DescriptorProtos.MessageOptions;
 import com.google.protobuf.DescriptorProtos.OneofDescriptorProto;
+import com.google.protobuf.DescriptorProtos.SourceCodeInfo;
 import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.DynamicMessage;
 import com.google.protobuf.TimestampProto;
 
+import java.util.Arrays;
+
 /**
- * Builds descriptor sets for tests without protoc. Two message families exist. {@code test.Event}
- * exercises every type mapping. {@code test.Simple} keeps end-to-end assertions short. Version 2 of
- * each adds fields, which is the producer-side change the format must absorb.
+ * Builds descriptor sets for tests without protoc. {@code test.Event} exercises every type mapping,
+ * {@code test.Simple} keeps end-to-end assertions short and {@code test.Nested} carries a
+ * message-typed field. {@link Variant} models the producer-side changes the format must absorb.
  *
  * <pre>
  * syntax = "proto3";
@@ -45,16 +48,20 @@ import com.google.protobuf.TimestampProto;
  * import "google/protobuf/timestamp.proto";
  *
  * enum Level { LOW = 0; HIGH = 1; }
- * message Address { string city = 1; string zip = 2; [v2: string street = 3;] }
+ * message Address { string city = 1; string zip = 2; [V2_ADDED: string street = 3;] }
  * message Event {
  *   int64 id = 1; string name = 2; double score = 3; bool active = 4; bytes payload = 5;
  *   Level level = 6; Address address = 7; repeated string tags = 8;
  *   map&lt;string, int32&gt; counts = 9; google.protobuf.Timestamp ts = 10; uint64 big = 11;
- *   optional int32 maybe = 12; repeated Address addresses = 13; [v2: string region = 14;]
+ *   optional int32 maybe = 12; repeated Address addresses = 13; [V2_ADDED: string region = 14;]
  * }
  * message Node { string name = 1; Node child = 2; }
- * message Simple { int64 id = 1; string name = 2; [v2: string region = 3;] }
+ * message Simple { int64 id = 1; string name = 2; [V2_ADDED: string region = 3;] }
+ * message Nested { int64 id = 1; Address address = 2; }
  * </pre>
+ *
+ * <p>The file carries {@code source_code_info} with leading comments on {@code Simple.name}, {@code
+ * Address.city} and {@code Event.address}, as {@code protoc --include_source_info} writes.
  */
 public class TestProtobufDescriptors {
 
@@ -62,17 +69,48 @@ public class TestProtobufDescriptors {
     public static final String EVENT = "test.Event";
     public static final String NODE = "test.Node";
     public static final String SIMPLE = "test.Simple";
+    public static final String NESTED = "test.Nested";
+
+    public static final String SIMPLE_NAME_COMMENT = "Display name.";
+    public static final String ADDRESS_CITY_COMMENT = "City name.";
+    public static final String EVENT_ADDRESS_COMMENT = "Where it happened.";
+
+    /** Producer-side changes relative to {@link #V1}. */
+    public enum Variant {
+        /** The original schema. */
+        V1,
+        /** Adds {@code Address.street}, {@code Event.region} and {@code Simple.region}. */
+        V2_ADDED,
+        /**
+         * Renames {@code Simple.name} to {@code title} and {@code Address.zip} to {@code postal}.
+         */
+        V2_RENAMED,
+        /** Removes {@code Simple.name} and {@code Address.zip}. */
+        V2_DROPPED,
+        /** Changes the comment of {@code Simple.name}. */
+        V2_COMMENT
+    }
+
+    private static final int ADDRESS_INDEX = 0;
+    private static final int EVENT_INDEX = 1;
+    private static final int SIMPLE_INDEX = 3;
 
     public static FileDescriptorSet descriptorSet(boolean v2) {
+        return descriptorSet(v2 ? Variant.V2_ADDED : Variant.V1);
+    }
+
+    public static FileDescriptorSet descriptorSet(Variant variant) {
         return FileDescriptorSet.newBuilder()
                 .addFile(TimestampProto.getDescriptor().toProto())
-                .addFile(file(v2))
+                .addFile(file(variant))
                 .build();
     }
 
     /** Same as {@link #descriptorSet} but without the imported google file. */
     public static FileDescriptorSet descriptorSetWithoutImports(boolean v2) {
-        return FileDescriptorSet.newBuilder().addFile(file(v2)).build();
+        return FileDescriptorSet.newBuilder()
+                .addFile(file(v2 ? Variant.V2_ADDED : Variant.V1))
+                .build();
     }
 
     public static Descriptor descriptor(FileDescriptorSet set, String messageName) {
@@ -83,13 +121,21 @@ public class TestProtobufDescriptors {
         }
     }
 
-    private static FileDescriptorProto file(boolean v2) {
+    private static FileDescriptorProto file(Variant variant) {
         DescriptorProto.Builder address =
                 DescriptorProto.newBuilder()
                         .setName("Address")
-                        .addField(scalar("city", 1, Type.TYPE_STRING))
-                        .addField(scalar("zip", 2, Type.TYPE_STRING));
-        if (v2) {
+                        .addField(scalar("city", 1, Type.TYPE_STRING));
+        switch (variant) {
+            case V2_RENAMED:
+                address.addField(scalar("postal", 2, Type.TYPE_STRING));
+                break;
+            case V2_DROPPED:
+                break;
+            default:
+                address.addField(scalar("zip", 2, Type.TYPE_STRING));
+        }
+        if (variant == Variant.V2_ADDED) {
             address.addField(scalar("street", 3, Type.TYPE_STRING));
         }
 
@@ -148,7 +194,7 @@ public class TestProtobufDescriptors {
                                         .build())
                         .addOneofDecl(OneofDescriptorProto.newBuilder().setName("_maybe"))
                         .addField(typed("addresses", 13, Type.TYPE_MESSAGE, ".test.Address", true));
-        if (v2) {
+        if (variant == Variant.V2_ADDED) {
             event.addField(scalar("region", 14, Type.TYPE_STRING));
         }
 
@@ -162,11 +208,54 @@ public class TestProtobufDescriptors {
         DescriptorProto.Builder simple =
                 DescriptorProto.newBuilder()
                         .setName("Simple")
-                        .addField(scalar("id", 1, Type.TYPE_INT64))
-                        .addField(scalar("name", 2, Type.TYPE_STRING));
-        if (v2) {
+                        .addField(scalar("id", 1, Type.TYPE_INT64));
+        switch (variant) {
+            case V2_RENAMED:
+                simple.addField(scalar("title", 2, Type.TYPE_STRING));
+                break;
+            case V2_DROPPED:
+                break;
+            default:
+                simple.addField(scalar("name", 2, Type.TYPE_STRING));
+        }
+        if (variant == Variant.V2_ADDED) {
             simple.addField(scalar("region", 3, Type.TYPE_STRING));
         }
+
+        DescriptorProto nested =
+                DescriptorProto.newBuilder()
+                        .setName("Nested")
+                        .addField(scalar("id", 1, Type.TYPE_INT64))
+                        .addField(typed("address", 2, Type.TYPE_MESSAGE, ".test.Address", false))
+                        .build();
+
+        SourceCodeInfo.Builder sourceInfo = SourceCodeInfo.newBuilder();
+        if (variant != Variant.V2_DROPPED) {
+            // Simple.name / Simple.title is the second field of the fourth message
+            sourceInfo.addLocation(
+                    location(
+                            variant == Variant.V2_COMMENT
+                                    ? "Display name, shown to the user."
+                                    : SIMPLE_NAME_COMMENT,
+                            FileDescriptorProto.MESSAGE_TYPE_FIELD_NUMBER,
+                            SIMPLE_INDEX,
+                            DescriptorProto.FIELD_FIELD_NUMBER,
+                            1));
+        }
+        sourceInfo.addLocation(
+                location(
+                        ADDRESS_CITY_COMMENT,
+                        FileDescriptorProto.MESSAGE_TYPE_FIELD_NUMBER,
+                        ADDRESS_INDEX,
+                        DescriptorProto.FIELD_FIELD_NUMBER,
+                        0));
+        sourceInfo.addLocation(
+                location(
+                        EVENT_ADDRESS_COMMENT,
+                        FileDescriptorProto.MESSAGE_TYPE_FIELD_NUMBER,
+                        EVENT_INDEX,
+                        DescriptorProto.FIELD_FIELD_NUMBER,
+                        6));
 
         return FileDescriptorProto.newBuilder()
                 .setName(FILE_NAME)
@@ -178,6 +267,15 @@ public class TestProtobufDescriptors {
                 .addMessageType(event)
                 .addMessageType(node)
                 .addMessageType(simple)
+                .addMessageType(nested)
+                .setSourceCodeInfo(sourceInfo)
+                .build();
+    }
+
+    private static SourceCodeInfo.Location location(String leadingComment, Integer... path) {
+        return SourceCodeInfo.Location.newBuilder()
+                .addAllPath(Arrays.asList(path))
+                .setLeadingComments(" " + leadingComment + "\n")
                 .build();
     }
 
@@ -243,23 +341,45 @@ public class TestProtobufDescriptors {
                 .build();
     }
 
-    public static DynamicMessage address(Descriptor addressType, String city, String zip) {
-        return DynamicMessage.newBuilder(addressType)
-                .setField(addressType.findFieldByName("city"), city)
-                .setField(addressType.findFieldByName("zip"), zip)
-                .build();
+    /**
+     * An {@code Address}; the second field is {@code zip} or {@code postal} depending on variant.
+     */
+    public static DynamicMessage address(Descriptor addressType, String city, String second) {
+        DynamicMessage.Builder builder =
+                DynamicMessage.newBuilder(addressType)
+                        .setField(addressType.findFieldByName("city"), city);
+        FieldDescriptor secondField = addressType.findFieldByNumber(2);
+        if (secondField != null && second != null) {
+            builder.setField(secondField, second);
+        }
+        return builder.build();
     }
 
-    /** A {@code test.Simple}; {@code region} is set only when the descriptor has it. */
+    /**
+     * A {@code test.Simple}. Field 2 is {@code name} or {@code title} depending on the variant and
+     * may be absent; {@code region} is set only when the descriptor has it.
+     */
     public static byte[] simple(Descriptor simple, long id, String name, String region) {
         DynamicMessage.Builder builder =
-                DynamicMessage.newBuilder(simple)
-                        .setField(simple.findFieldByName("id"), id)
-                        .setField(simple.findFieldByName("name"), name);
-        FieldDescriptor regionField = simple.findFieldByName("region");
+                DynamicMessage.newBuilder(simple).setField(simple.findFieldByNumber(1), id);
+        FieldDescriptor second = simple.findFieldByNumber(2);
+        if (second != null && name != null) {
+            builder.setField(second, name);
+        }
+        FieldDescriptor regionField = simple.findFieldByNumber(3);
         if (regionField != null && region != null) {
             builder.setField(regionField, region);
         }
         return builder.build().toByteArray();
+    }
+
+    /** A {@code test.Nested} with an embedded address. */
+    public static byte[] nested(Descriptor nested, long id, String city, String second) {
+        Descriptor addressType = nested.findFieldByNumber(2).getMessageType();
+        return DynamicMessage.newBuilder(nested)
+                .setField(nested.findFieldByNumber(1), id)
+                .setField(nested.findFieldByNumber(2), address(addressType, city, second))
+                .build()
+                .toByteArray();
     }
 }

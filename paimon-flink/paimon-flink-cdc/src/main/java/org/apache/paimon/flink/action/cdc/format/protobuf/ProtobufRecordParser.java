@@ -34,6 +34,7 @@ import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +54,10 @@ public class ProtobufRecordParser extends AbstractRecordParser {
 
     private ProtobufSourceRecord root;
 
+    // records from one descriptor share one schema byte array; parse it once
+    private byte[] cachedSchema;
+    private List<DataField> cachedFields;
+
     public ProtobufRecordParser(TypeMapping typeMapping, List<ComputedColumn> computedColumns) {
         super(typeMapping, computedColumns);
     }
@@ -66,13 +71,21 @@ public class ProtobufRecordParser extends AbstractRecordParser {
     @Override
     protected List<RichCdcMultiplexRecord> extractRecords() {
         CdcSchema.Builder schemaBuilder = CdcSchema.newBuilder();
-        for (DataField field : root.fields()) {
+        for (DataField field : fieldsOf(root)) {
             schemaBuilder.column(field.name(), applyTypeMapping(field.type()), field.description());
         }
         Map<String, String> rowData = new LinkedHashMap<>(root.values());
         evalComputedColumns(rowData, schemaBuilder);
         evalMetadataColumns(rowData, schemaBuilder);
         return Collections.singletonList(createRecord(RowKind.INSERT, rowData, schemaBuilder));
+    }
+
+    private List<DataField> fieldsOf(ProtobufSourceRecord record) {
+        if (cachedSchema == null || !Arrays.equals(cachedSchema, record.schemaBytes())) {
+            cachedSchema = record.schemaBytes();
+            cachedFields = record.fields();
+        }
+        return cachedFields;
     }
 
     private DataType applyTypeMapping(DataType type) {

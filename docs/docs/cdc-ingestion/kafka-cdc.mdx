@@ -169,6 +169,30 @@ For `kafka_sync_database`, the format uses the topic name as both database and t
 protobuf messages carry neither. Rename targets with `--table_mapping`, `--table_prefix` or
 `--table_suffix`.
 
+#### Column comments and field identity
+
+Every column the format creates carries a description of the form `<comment> [proto:<number>]`.
+The comment is the field's leading comment from the descriptor set, present when it was written
+with `protoc --include_source_info`, and the marker is the protobuf field number. Editing a comment
+in the proto updates the column description on the next record.
+
+The marker is what lets the sink follow the two changes it cannot see from names alone. Both are
+table options, off by default.
+
+| Table option | Effect |
+| --- | --- |
+| `cdc.schema-evolution.rename-by-comment=true` | A field with an unknown name whose marker matches a column the source no longer has is renamed, not added. The column keeps its field id, so history reads under the new name. Works inside nested messages too. |
+| `cdc.schema-evolution.drop-missing-columns=true` | A column with a marker that the source no longer has is dropped, top-level or nested. Partition keys, primary keys and unmarked columns such as computed columns are never dropped. A column re-added later with the same name gets a new field id, so old files show `NULL` for it. |
+
+Dropping is only safe with a format whose record schema is the complete schema derived from a
+descriptor, which protobuf is. The action refuses the option for formats that derive the schema
+from each record.
+
+Type changes follow the usual rules. Widening such as `int32` to `int64` or `float` to `double`
+updates the column type. Narrowing is ignored. A change protobuf itself cannot carry on the wire,
+such as `int64` to `string`, fails the job until the descriptor is put back, and a producer still
+on the old schema decodes to `NULL` for that field.
+
 ### Table Action Reference
 
 Command syntax (square brackets indicate optional arguments):
@@ -284,6 +308,14 @@ Pass these options through `--kafka_conf` in addition to the source connection s
 | `protobuf.message-name` | None | Fully qualified message name, required for `value.format=protobuf`. |
 | `protobuf.descriptor-set.refresh-interval` | 0 | How often to check the descriptor set for changes. Zero disables the check. |
 | `protobuf.read-default-values` | false | Emit protobuf default values for unset fields instead of `NULL`. |
+
+Two table options, passed with `--table_conf`, let the sink follow renames and deletions of
+protobuf fields. See [Column comments and field identity](#column-comments-and-field-identity).
+
+| Table option | Default | Description |
+| --- | --- | --- |
+| `cdc.schema-evolution.rename-by-comment` | false | Rename a column when a source field with a new name carries the same `[proto:N]` marker as a vanished column. |
+| `cdc.schema-evolution.drop-missing-columns` | false | Drop marked columns the source no longer has. Only for formats that provide the complete schema, such as protobuf. |
 
 ## Debezium-bson
 

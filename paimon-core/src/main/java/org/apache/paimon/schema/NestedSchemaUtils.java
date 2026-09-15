@@ -27,13 +27,17 @@ import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Preconditions;
 
+import javax.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Utility class for handling nested column schema changes. This provides shared logic for both
@@ -57,15 +61,34 @@ public class NestedSchemaUtils {
             DataType oldType,
             DataType newType,
             List<SchemaChange> schemaChanges) {
+        generateNestedColumnUpdates(fieldNames, oldType, newType, schemaChanges, null, true);
+    }
 
+    /**
+     * Variant used by CDC sinks. {@code identityOf} extracts a stable identity from a field
+     * description, so a nested field that vanished and one that appeared with the same identity
+     * become a rename instead of a drop and add. {@code dropMissing} controls whether nested fields
+     * the new type lacks are dropped at all.
+     */
+    public static void generateNestedColumnUpdates(
+            List<String> fieldNames,
+            DataType oldType,
+            DataType newType,
+            List<SchemaChange> schemaChanges,
+            @Nullable Function<String, Optional<String>> identityOf,
+            boolean dropMissing) {
         if (oldType.getTypeRoot() == DataTypeRoot.ROW) {
-            handleRowTypeUpdate(fieldNames, oldType, newType, schemaChanges);
+            handleRowTypeUpdate(
+                    fieldNames, oldType, newType, schemaChanges, identityOf, dropMissing);
         } else if (oldType.getTypeRoot() == DataTypeRoot.ARRAY) {
-            handleArrayTypeUpdate(fieldNames, oldType, newType, schemaChanges);
+            handleArrayTypeUpdate(
+                    fieldNames, oldType, newType, schemaChanges, identityOf, dropMissing);
         } else if (oldType.getTypeRoot() == DataTypeRoot.MAP) {
-            handleMapTypeUpdate(fieldNames, oldType, newType, schemaChanges);
+            handleMapTypeUpdate(
+                    fieldNames, oldType, newType, schemaChanges, identityOf, dropMissing);
         } else if (oldType.getTypeRoot() == DataTypeRoot.MULTISET) {
-            handleMultisetTypeUpdate(fieldNames, oldType, newType, schemaChanges);
+            handleMultisetTypeUpdate(
+                    fieldNames, oldType, newType, schemaChanges, identityOf, dropMissing);
         } else {
             // For primitive types, update the column type directly
             handlePrimitiveTypeUpdate(fieldNames, oldType, newType, schemaChanges);
@@ -79,10 +102,10 @@ public class NestedSchemaUtils {
             List<String> fieldNames,
             DataType oldType,
             DataType newType,
-            List<SchemaChange> schemaChanges) {
-
+            List<SchemaChange> schemaChanges,
+            @Nullable Function<String, Optional<String>> identityOf,
+            boolean dropMissing) {
         String joinedNames = String.join(".", fieldNames);
-
         Preconditions.checkArgument(
                 newType.getTypeRoot() == DataTypeRoot.ROW,
                 "Column %s can only be updated to row type, and cannot be updated to %s type",
@@ -91,19 +114,58 @@ public class NestedSchemaUtils {
 
         RowType oldRowType = (RowType) oldType;
         RowType newRowType = (RowType) newType;
+        Set<String> newFieldNames = new HashSet<>(newRowType.getFieldNames());
+
+        // renames: a vanished old field and an unknown new field that share one identity
+        Map<String, String> newToOld = new HashMap<>();
+        if (identityOf != null) {
+            Map<String, List<DataField>> vanishedByIdentity = new HashMap<>();
+            for (DataField oldField : oldRowType.getFields()) {
+                if (!newFieldNames.contains(oldField.name())) {
+                    identityOf
+                            .apply(oldField.description())
+                            .ifPresent(
+                                    id ->
+                                            vanishedByIdentity
+                                                    .computeIfAbsent(id, k -> new ArrayList<>())
+                                                    .add(oldField));
+                }
+            }
+            for (DataField newField : newRowType.getFields()) {
+                if (oldRowType.containsField(newField.name())) {
+                    continue;
+                }
+                Optional<String> identity = identityOf.apply(newField.description());
+                if (!identity.isPresent()) {
+                    continue;
+                }
+                List<DataField> vanished = vanishedByIdentity.get(identity.get());
+                if (vanished != null && vanished.size() == 1) {
+                    newToOld.put(newField.name(), vanished.get(0).name());
+                    vanishedByIdentity.remove(identity.get());
+                }
+            }
+            for (Map.Entry<String, String> rename : newToOld.entrySet()) {
+                List<String> renamePath = new ArrayList<>(fieldNames);
+                renamePath.add(rename.getValue());
+                schemaChanges.add(
+                        SchemaChange.renameColumn(
+                                renamePath.toArray(new String[0]), rename.getKey()));
+            }
+        }
 
         // check that existing fields maintain their order
         Map<String, Integer> oldFieldOrders = new HashMap<>();
         for (int i = 0; i < oldRowType.getFieldCount(); i++) {
             oldFieldOrders.put(oldRowType.getFields().get(i).name(), i);
         }
-
         int lastIdx = -1;
         String lastFieldName = "";
         for (DataField newField : newRowType.getFields()) {
             String name = newField.name();
-            if (oldFieldOrders.containsKey(name)) {
-                int idx = oldFieldOrders.get(name);
+            String oldName = newToOld.getOrDefault(name, name);
+            if (oldFieldOrders.containsKey(oldName)) {
+                int idx = oldFieldOrders.get(oldName);
                 Preconditions.checkState(
                         lastIdx < idx,
                         "Order of existing fields in column %s must be kept the same. "
@@ -116,23 +178,13 @@ public class NestedSchemaUtils {
             }
         }
 
-        // drop fields
-        Set<String> newFieldNames = new HashSet<>(newRowType.getFieldNames());
-        for (String name : oldRowType.getFieldNames()) {
-            if (!newFieldNames.contains(name)) {
-                List<String> dropColumnNames = new ArrayList<>(fieldNames);
-                dropColumnNames.add(name);
-                schemaChanges.add(SchemaChange.dropColumn(dropColumnNames.toArray(new String[0])));
-            }
-        }
-
         for (int i = 0; i < newRowType.getFieldCount(); i++) {
             DataField field = newRowType.getFields().get(i);
             String name = field.name();
+            String oldName = newToOld.getOrDefault(name, name);
             List<String> fullFieldNames = new ArrayList<>(fieldNames);
             fullFieldNames.add(name);
-
-            if (!oldFieldOrders.containsKey(name)) {
+            if (!oldFieldOrders.containsKey(oldName)) {
                 // add fields
                 SchemaChange.Move move;
                 if (i == 0) {
@@ -148,15 +200,32 @@ public class NestedSchemaUtils {
                                 field.description(),
                                 move));
             } else {
-                // update existing fields
-                DataField oldField = oldRowType.getFields().get(oldFieldOrders.get(name));
+                // update existing fields, under the new name when renamed
+                DataField oldField = oldRowType.getFields().get(oldFieldOrders.get(oldName));
                 if (!Objects.equals(oldField.description(), field.description())) {
                     schemaChanges.add(
                             SchemaChange.updateColumnComment(
                                     fullFieldNames.toArray(new String[0]), field.description()));
                 }
                 generateNestedColumnUpdates(
-                        fullFieldNames, oldField.type(), field.type(), schemaChanges);
+                        fullFieldNames,
+                        oldField.type(),
+                        field.type(),
+                        schemaChanges,
+                        identityOf,
+                        dropMissing);
+            }
+        }
+
+        // drop fields, after adds so a row type never ends up empty midway
+        if (dropMissing) {
+            for (String name : oldRowType.getFieldNames()) {
+                if (!newFieldNames.contains(name) && !newToOld.containsValue(name)) {
+                    List<String> dropColumnNames = new ArrayList<>(fieldNames);
+                    dropColumnNames.add(name);
+                    schemaChanges.add(
+                            SchemaChange.dropColumn(dropColumnNames.toArray(new String[0])));
+                }
             }
         }
     }
@@ -165,7 +234,9 @@ public class NestedSchemaUtils {
             List<String> fieldNames,
             DataType oldType,
             DataType newType,
-            List<SchemaChange> schemaChanges) {
+            List<SchemaChange> schemaChanges,
+            @Nullable Function<String, Optional<String>> identityOf,
+            boolean dropMissing) {
 
         String joinedNames = String.join(".", fieldNames);
         Preconditions.checkArgument(
@@ -182,14 +253,18 @@ public class NestedSchemaUtils {
                 fullFieldNames,
                 ((ArrayType) oldType).getElementType(),
                 ((ArrayType) newType).getElementType(),
-                schemaChanges);
+                schemaChanges,
+                identityOf,
+                dropMissing);
     }
 
     private static void handleMapTypeUpdate(
             List<String> fieldNames,
             DataType oldType,
             DataType newType,
-            List<SchemaChange> schemaChanges) {
+            List<SchemaChange> schemaChanges,
+            @Nullable Function<String, Optional<String>> identityOf,
+            boolean dropMissing) {
 
         String joinedNames = String.join(".", fieldNames);
         Preconditions.checkArgument(
@@ -216,14 +291,18 @@ public class NestedSchemaUtils {
                 fullFieldNames,
                 oldMapType.getValueType(),
                 newMapType.getValueType(),
-                schemaChanges);
+                schemaChanges,
+                identityOf,
+                dropMissing);
     }
 
     private static void handleMultisetTypeUpdate(
             List<String> fieldNames,
             DataType oldType,
             DataType newType,
-            List<SchemaChange> schemaChanges) {
+            List<SchemaChange> schemaChanges,
+            @Nullable Function<String, Optional<String>> identityOf,
+            boolean dropMissing) {
 
         String joinedNames = String.join(".", fieldNames);
 
@@ -241,7 +320,9 @@ public class NestedSchemaUtils {
                 fullFieldNames,
                 ((MultisetType) oldType).getElementType(),
                 ((MultisetType) newType).getElementType(),
-                schemaChanges);
+                schemaChanges,
+                identityOf,
+                dropMissing);
     }
 
     private static void handlePrimitiveTypeUpdate(
