@@ -29,6 +29,7 @@ import java.time.Duration;
 
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.DESCRIPTOR_SET_PATH;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.DESCRIPTOR_SET_REFRESH_INTERVAL;
+import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.FLATTEN_NESTED_MESSAGES;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.MESSAGE_NAME;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.READ_DEFAULT_VALUES;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
@@ -46,6 +47,7 @@ public class ProtobufSourceRecordDecoder implements Serializable {
     private final String messageName;
     private final Duration refreshInterval;
     private final boolean readDefaultValues;
+    private final boolean flattenNestedMessages;
 
     private transient ProtobufDescriptorProvider descriptorProvider;
     private transient ProtobufSchemaConverter converter;
@@ -57,6 +59,7 @@ public class ProtobufSourceRecordDecoder implements Serializable {
         this.messageName = required(config, MESSAGE_NAME);
         this.refreshInterval = config.get(DESCRIPTOR_SET_REFRESH_INTERVAL);
         this.readDefaultValues = config.get(READ_DEFAULT_VALUES);
+        this.flattenNestedMessages = config.get(FLATTEN_NESTED_MESSAGES);
     }
 
     private static String required(Configuration config, ConfigOption<String> option) {
@@ -70,7 +73,7 @@ public class ProtobufSourceRecordDecoder implements Serializable {
     public void open() {
         descriptorProvider =
                 new ProtobufDescriptorProvider(descriptorSetPath, messageName, refreshInterval);
-        converter = new ProtobufSchemaConverter(readDefaultValues);
+        converter = new ProtobufSchemaConverter(readDefaultValues, flattenNestedMessages);
     }
 
     public ProtobufSourceRecord decode(byte[] bytes) throws IOException {

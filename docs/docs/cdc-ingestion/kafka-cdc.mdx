@@ -155,10 +155,27 @@ where the Flink cluster can read it.
 ```
 
 Column types follow the message. Integers map to `INT` or `BIGINT`, `uint64` to `DECIMAL(20, 0)`,
-`bytes` to `STRING` holding base64, enums to `STRING` holding the value name,
-`google.protobuf.Timestamp` to `TIMESTAMP(6)` in UTC, nested messages to `ROW`, repeated fields to
-`ARRAY` and map fields to `MAP`. Unset fields are `NULL` unless `protobuf.read-default-values` is
-true.
+`bytes` to `STRING` holding base64, enums to `STRING` holding the value name, nested messages to
+`ROW`, repeated fields to `ARRAY` and map fields to `MAP`. Unset fields are `NULL` unless
+`protobuf.read-default-values` is true.
+
+The google well-known types map to the Paimon type that carries their meaning:
+
+| Protobuf | Paimon |
+| --- | --- |
+| `google.protobuf.Timestamp` | `TIMESTAMP_LTZ(6)`, the instant; nanoseconds are truncated |
+| `google.protobuf.Duration` | `DECIMAL(20, 9)` seconds |
+| `google.protobuf.Struct`, `Value`, `ListValue` | `STRING` holding JSON |
+| `google.protobuf.FieldMask` | `STRING` holding the comma separated paths |
+| `google.protobuf.Empty` | `BOOLEAN`, `true` when set |
+| `google.protobuf.Int32Value` and the other wrappers | the wrapped scalar |
+
+With `protobuf.flatten-nested-messages=true`, a singular message field does not become a `ROW`.
+Its leaves become columns named `<field>_<leaf>`, nested messages inside it likewise, so
+`client.device.model` becomes `client_device_model`. Repeated and map fields keep their `ROW`
+element type. A flattened column's identity marker is the field number path, for example
+`[proto:7.2]`, so renames and deletions inside the message are followed like top-level ones. Two
+fields that flatten to the same column name are rejected when the schema is built.
 
 When producers add fields to the message, publish the new descriptor set to the same path. With a
 refresh interval set, the job picks it up and the schema evolution of the sink adds the columns.
@@ -308,6 +325,7 @@ Pass these options through `--kafka_conf` in addition to the source connection s
 | `protobuf.message-name` | None | Fully qualified message name, required for `value.format=protobuf`. |
 | `protobuf.descriptor-set.refresh-interval` | 0 | How often to check the descriptor set for changes. Zero disables the check. |
 | `protobuf.read-default-values` | false | Emit protobuf default values for unset fields instead of `NULL`. |
+| `protobuf.flatten-nested-messages` | false | One column per leaf of a singular message field, named `<field>_<leaf>`, instead of a `ROW` column. |
 
 Two table options, passed with `--table_conf`, let the sink follow renames and deletions of
 protobuf fields. See [Column comments and field identity](#column-comments-and-field-identity).

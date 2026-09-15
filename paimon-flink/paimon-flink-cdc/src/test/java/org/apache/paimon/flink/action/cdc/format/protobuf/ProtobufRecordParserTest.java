@@ -37,6 +37,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -86,7 +89,7 @@ public class ProtobufRecordParserTest {
         assertThat(schema.primaryKeys()).isEmpty();
         Map<String, DataType> types = typesOf(schema.fields());
         assertThat(types.get("id")).isEqualTo(DataTypes.BIGINT());
-        assertThat(types.get("ts")).isEqualTo(DataTypes.TIMESTAMP(6));
+        assertThat(types.get("ts")).isEqualTo(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6));
         assertThat(types.get("big")).isEqualTo(DataTypes.DECIMAL(20, 0));
         assertThat(types.get("tags")).isEqualTo(DataTypes.ARRAY(DataTypes.STRING()));
         assertThat(
@@ -115,7 +118,12 @@ public class ProtobufRecordParserTest {
         assertThat(result.toRichCdcRecord().toCdcRecord().data())
                 .containsEntry("id", "42")
                 .containsEntry("name", "alice")
-                .containsEntry("ts", "2023-11-14 22:13:20.123456")
+                .containsEntry(
+                        "ts",
+                        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")
+                                .format(
+                                        Instant.ofEpochSecond(1700000000L, 123456789)
+                                                .atZone(ZoneId.systemDefault())))
                 .containsEntry("address", "{\"city\":\"Copenhagen\",\"zip\":\"2100\"}");
     }
 

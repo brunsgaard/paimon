@@ -19,6 +19,7 @@
 package org.apache.paimon.flink.action.cdc.format.protobuf;
 
 import org.apache.paimon.schema.ColumnIdentityMarker;
+import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -29,15 +30,21 @@ import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.DynamicMessage;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.EVENT;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.NODE;
+import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.WELL_KNOWN;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.descriptor;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.descriptorSet;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.fullEvent;
+import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.wellKnown;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link ProtobufSchemaConverter}. */
@@ -75,7 +82,7 @@ public class ProtobufSchemaConverterTest {
         assertThat(types.get("tags")).isEqualTo(DataTypes.ARRAY(DataTypes.STRING()));
         assertThat(types.get("counts"))
                 .isEqualTo(DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()));
-        assertThat(types.get("ts")).isEqualTo(DataTypes.TIMESTAMP(6));
+        assertThat(types.get("ts")).isEqualTo(DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6));
         assertThat(types.get("big")).isEqualTo(DataTypes.DECIMAL(20, 0));
         assertThat(types.get("maybe")).isEqualTo(DataTypes.INT());
 
@@ -100,7 +107,7 @@ public class ProtobufSchemaConverterTest {
                 .containsEntry("address", "{\"city\":\"Copenhagen\",\"zip\":\"2100\"}")
                 .containsEntry("tags", "[\"a\",\"b\"]")
                 .containsEntry("counts", "{\"x\":\"1\"}")
-                .containsEntry("ts", "2023-11-14 22:13:20.123456")
+                .containsEntry("ts", localTimestamp(1700000000L, 123456789))
                 .containsEntry("big", "18446744073709551615")
                 .containsEntry("maybe", "7")
                 .containsEntry(
@@ -240,5 +247,102 @@ public class ProtobufSchemaConverterTest {
                                 DataField::type,
                                 (a, b) -> a,
                                 java.util.LinkedHashMap::new));
+    }
+
+    /** What the converter must emit for a TIMESTAMP_LTZ so the sink parses it back in its zone. */
+    private static String localTimestamp(long seconds, int nanos) {
+        return DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")
+                .format(Instant.ofEpochSecond(seconds, nanos).atZone(ZoneId.systemDefault()));
+    }
+
+    @Test
+    public void testWellKnownTypes() {
+        Descriptor type = descriptor(SET, WELL_KNOWN);
+        ProtobufSchemaConverter converter = new ProtobufSchemaConverter(false);
+
+        Map<String, DataType> types = typesOf(converter.toFields(type));
+        assertThat(types.get("took")).isEqualTo(DataTypes.DECIMAL(20, 9));
+        assertThat(types.get("attrs")).isEqualTo(DataTypes.STRING());
+        assertThat(types.get("any_value")).isEqualTo(DataTypes.STRING());
+        assertThat(types.get("items")).isEqualTo(DataTypes.STRING());
+        assertThat(types.get("marker")).isEqualTo(DataTypes.BOOLEAN());
+        assertThat(types.get("mask")).isEqualTo(DataTypes.STRING());
+        assertThat(types.get("label")).isEqualTo(DataTypes.STRING());
+
+        Map<String, String> values = converter.toValues(wellKnown(type));
+        assertThat(values)
+                .containsEntry("took", "1.500000000")
+                .containsEntry("attrs", "{\"a\":1.0,\"b\":[true,null]}")
+                .containsEntry("any_value", "\"x\"")
+                .containsEntry("items", "[2.5]")
+                .containsEntry("marker", "true")
+                .containsEntry("mask", "a.b,c")
+                .containsEntry("label", "hello");
+
+        // unset well-known fields are NULL, including the Empty marker
+        assertThat(converter.toValues(DynamicMessage.newBuilder(type).build())).isEmpty();
+    }
+
+    @Test
+    public void testFlattenedFields() {
+        ProtobufSchemaConverter converter = new ProtobufSchemaConverter(false, true);
+        List<DataField> fields = converter.toFields(EVENT_TYPE);
+        Map<String, DataType> types = typesOf(fields);
+
+        // the singular message is gone, its leaves are columns
+        assertThat(types.keySet())
+                .containsExactly(
+                        "id",
+                        "name",
+                        "score",
+                        "active",
+                        "payload",
+                        "level",
+                        "address_city",
+                        "address_zip",
+                        "tags",
+                        "counts",
+                        "ts",
+                        "big",
+                        "maybe",
+                        "addresses");
+        assertThat(types.get("address_city")).isEqualTo(DataTypes.STRING());
+        // identity is the number path, comment is the leaf's own comment
+        Map<String, String> descriptions = new LinkedHashMap<>();
+        fields.forEach(f -> descriptions.put(f.name(), f.description()));
+        assertThat(descriptions.get("address_city"))
+                .isEqualTo(TestProtobufDescriptors.ADDRESS_CITY_COMMENT + " [proto:7.1]");
+        assertThat(descriptions.get("address_zip")).isEqualTo("[proto:7.2]");
+        assertThat(descriptions.get("id")).isEqualTo("[proto:1]");
+        // repeated messages keep their ROW element
+        assertThat(types.get("addresses")).isInstanceOf(ArrayType.class);
+        assertThat(((ArrayType) types.get("addresses")).getElementType())
+                .isInstanceOf(RowType.class);
+        // ids stay dense
+        for (int i = 0; i < fields.size(); i++) {
+            assertThat(fields.get(i).id()).isEqualTo(i);
+        }
+
+        Map<String, String> values = converter.toValues(fullEvent(EVENT_TYPE));
+        assertThat(values)
+                .containsEntry("address_city", "Copenhagen")
+                .containsEntry("address_zip", "2100")
+                .doesNotContainKey("address");
+
+        // an unset message leaves its leaves NULL
+        DynamicMessage onlyId =
+                DynamicMessage.newBuilder(EVENT_TYPE)
+                        .setField(EVENT_TYPE.findFieldByName("id"), 1L)
+                        .build();
+        assertThat(converter.toValues(onlyId)).containsOnlyKeys("id");
+    }
+
+    @Test
+    public void testFlatteningStopsAtRecursion() {
+        Descriptor node = descriptor(SET, NODE);
+        Map<String, DataType> types =
+                typesOf(new ProtobufSchemaConverter(false, true).toFields(node));
+        assertThat(types.keySet()).containsExactly("name", "child");
+        assertThat(types.get("child")).isEqualTo(DataTypes.STRING());
     }
 }
