@@ -55,6 +55,7 @@ import static org.apache.flink.streaming.connectors.kafka.table.KafkaConnectorOp
 import static org.apache.flink.streaming.connectors.kafka.table.KafkaConnectorOptions.VALUE_FORMAT;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.DESCRIPTOR_SET_PATH;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.DESCRIPTOR_SET_REFRESH_INTERVAL;
+import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.FLATTEN_NESTED_MESSAGES;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.ProtobufOptions.MESSAGE_NAME;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.NESTED;
 import static org.apache.paimon.flink.action.cdc.format.protobuf.TestProtobufDescriptors.SIMPLE;
@@ -429,6 +430,64 @@ public class KafkaProtobufSyncTableActionITCase extends KafkaActionITCaseBase {
                         new DataType[] {DataTypes.BIGINT(), addressDropped},
                         new String[] {"id", "address"}),
                 Arrays.asList("+I[1, +I[Copenhagen]]", "+I[2, +I[Aarhus]]", "+I[3, +I[Odense]]"));
+    }
+
+    @Test
+    @Timeout(120)
+    public void testFlattenedNestedRenameAndDrop() throws Exception {
+        String topic = "protobuf-flattened";
+        createTestTopic(topic, 1, 1);
+        Path descriptorFile = descriptorDir.resolve("flattened.desc");
+        Files.write(
+                descriptorFile, TestProtobufDescriptors.descriptorSet(Variant.V1).toByteArray());
+        Descriptor nestedV1 =
+                TestProtobufDescriptors.descriptor(
+                        TestProtobufDescriptors.descriptorSet(Variant.V1), NESTED);
+        produce(topic, TestProtobufDescriptors.nested(nestedV1, 1L, "Copenhagen", "2100"));
+
+        Map<String, String> kafkaConfig = protobufKafkaConfig(topic, descriptorFile, NESTED);
+        kafkaConfig.put(FLATTEN_NESTED_MESSAGES.key(), "true");
+        runActionWithDefaultEnv(
+                syncTableActionBuilder(kafkaConfig).withTableConfig(evolvingTableConfig()).build());
+        FileStoreTable table = getFileStoreTable(tableName);
+        RowType flatV1 =
+                RowType.of(
+                        new DataType[] {DataTypes.BIGINT(), DataTypes.STRING(), DataTypes.STRING()},
+                        new String[] {"id", "address_city", "address_zip"});
+        waitForResult(
+                Collections.singletonList("+I[1, Copenhagen, 2100]"),
+                table,
+                flatV1,
+                Collections.emptyList());
+        assertThat(fieldNamed(table, "address_zip").description()).isEqualTo("[proto:2.2]");
+
+        // zip -> postal inside the nested message renames the flattened column
+        publish(descriptorFile, Variant.V2_RENAMED);
+        Descriptor nestedRenamed =
+                TestProtobufDescriptors.descriptor(
+                        TestProtobufDescriptors.descriptorSet(Variant.V2_RENAMED), NESTED);
+        produce(topic, TestProtobufDescriptors.nested(nestedRenamed, 2L, "Aarhus", "8000"));
+        waitForResult(
+                Arrays.asList("+I[1, Copenhagen, 2100]", "+I[2, Aarhus, 8000]"),
+                table,
+                RowType.of(
+                        new DataType[] {DataTypes.BIGINT(), DataTypes.STRING(), DataTypes.STRING()},
+                        new String[] {"id", "address_city", "address_postal"}),
+                Collections.emptyList());
+
+        // postal removed inside the nested message drops the flattened column
+        publish(descriptorFile, Variant.V2_DROPPED);
+        Descriptor nestedDropped =
+                TestProtobufDescriptors.descriptor(
+                        TestProtobufDescriptors.descriptorSet(Variant.V2_DROPPED), NESTED);
+        produce(topic, TestProtobufDescriptors.nested(nestedDropped, 3L, "Odense", null));
+        waitForResult(
+                Arrays.asList("+I[1, Copenhagen]", "+I[2, Aarhus]", "+I[3, Odense]"),
+                table,
+                RowType.of(
+                        new DataType[] {DataTypes.BIGINT(), DataTypes.STRING()},
+                        new String[] {"id", "address_city"}),
+                Collections.emptyList());
     }
 
     /**

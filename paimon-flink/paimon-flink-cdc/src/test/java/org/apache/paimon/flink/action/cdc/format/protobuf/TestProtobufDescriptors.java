@@ -32,8 +32,13 @@ import com.google.protobuf.DescriptorProtos.OneofDescriptorProto;
 import com.google.protobuf.DescriptorProtos.SourceCodeInfo;
 import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.Descriptors.FieldDescriptor;
+import com.google.protobuf.DurationProto;
 import com.google.protobuf.DynamicMessage;
+import com.google.protobuf.EmptyProto;
+import com.google.protobuf.FieldMaskProto;
+import com.google.protobuf.StructProto;
 import com.google.protobuf.TimestampProto;
+import com.google.protobuf.WrappersProto;
 
 import java.util.Arrays;
 
@@ -58,6 +63,12 @@ import java.util.Arrays;
  * message Node { string name = 1; Node child = 2; }
  * message Simple { int64 id = 1; string name = 2; [V2_ADDED: string region = 3;] }
  * message Nested { int64 id = 1; Address address = 2; }
+ * message WellKnown {
+ *   google.protobuf.Duration took = 1; google.protobuf.Struct attrs = 2;
+ *   google.protobuf.Value any_value = 3; google.protobuf.ListValue items = 4;
+ *   google.protobuf.Empty marker = 5; google.protobuf.FieldMask mask = 6;
+ *   google.protobuf.StringValue label = 7;
+ * }
  * </pre>
  *
  * <p>The file carries {@code source_code_info} with leading comments on {@code Simple.name}, {@code
@@ -70,6 +81,7 @@ public class TestProtobufDescriptors {
     public static final String NODE = "test.Node";
     public static final String SIMPLE = "test.Simple";
     public static final String NESTED = "test.Nested";
+    public static final String WELL_KNOWN = "test.WellKnown";
 
     public static final String SIMPLE_NAME_COMMENT = "Display name.";
     public static final String ADDRESS_CITY_COMMENT = "City name.";
@@ -102,6 +114,11 @@ public class TestProtobufDescriptors {
     public static FileDescriptorSet descriptorSet(Variant variant) {
         return FileDescriptorSet.newBuilder()
                 .addFile(TimestampProto.getDescriptor().toProto())
+                .addFile(DurationProto.getDescriptor().toProto())
+                .addFile(StructProto.getDescriptor().toProto())
+                .addFile(EmptyProto.getDescriptor().toProto())
+                .addFile(FieldMaskProto.getDescriptor().toProto())
+                .addFile(WrappersProto.getDescriptor().toProto())
                 .addFile(file(variant))
                 .build();
     }
@@ -229,6 +246,60 @@ public class TestProtobufDescriptors {
                         .addField(typed("address", 2, Type.TYPE_MESSAGE, ".test.Address", false))
                         .build();
 
+        DescriptorProto wellKnown =
+                DescriptorProto.newBuilder()
+                        .setName("WellKnown")
+                        .addField(
+                                typed(
+                                        "took",
+                                        1,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.Duration",
+                                        false))
+                        .addField(
+                                typed(
+                                        "attrs",
+                                        2,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.Struct",
+                                        false))
+                        .addField(
+                                typed(
+                                        "any_value",
+                                        3,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.Value",
+                                        false))
+                        .addField(
+                                typed(
+                                        "items",
+                                        4,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.ListValue",
+                                        false))
+                        .addField(
+                                typed(
+                                        "marker",
+                                        5,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.Empty",
+                                        false))
+                        .addField(
+                                typed(
+                                        "mask",
+                                        6,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.FieldMask",
+                                        false))
+                        .addField(
+                                typed(
+                                        "label",
+                                        7,
+                                        Type.TYPE_MESSAGE,
+                                        ".google.protobuf.StringValue",
+                                        false))
+                        .build();
+
         SourceCodeInfo.Builder sourceInfo = SourceCodeInfo.newBuilder();
         if (variant != Variant.V2_DROPPED) {
             // Simple.name / Simple.title is the second field of the fourth message
@@ -262,12 +333,18 @@ public class TestProtobufDescriptors {
                 .setPackage("test")
                 .setSyntax("proto3")
                 .addDependency("google/protobuf/timestamp.proto")
+                .addDependency("google/protobuf/duration.proto")
+                .addDependency("google/protobuf/struct.proto")
+                .addDependency("google/protobuf/empty.proto")
+                .addDependency("google/protobuf/field_mask.proto")
+                .addDependency("google/protobuf/wrappers.proto")
                 .addEnumType(level)
                 .addMessageType(address)
                 .addMessageType(event)
                 .addMessageType(node)
                 .addMessageType(simple)
                 .addMessageType(nested)
+                .addMessageType(wellKnown)
                 .setSourceCodeInfo(sourceInfo)
                 .build();
     }
@@ -371,6 +448,100 @@ public class TestProtobufDescriptors {
             builder.setField(regionField, region);
         }
         return builder.build().toByteArray();
+    }
+
+    /**
+     * A {@code test.WellKnown} with every field set: 1.5 s, {@code {"a": 1, "b": [true, null]}},
+     * the string value {@code "x"}, the list {@code [2.5]}, an empty marker, mask {@code a.b,c} and
+     * label {@code hello}.
+     */
+    public static DynamicMessage wellKnown(Descriptor wellKnown) {
+        Descriptor durationType = wellKnown.findFieldByName("took").getMessageType();
+        Descriptor structType = wellKnown.findFieldByName("attrs").getMessageType();
+        Descriptor valueType = wellKnown.findFieldByName("any_value").getMessageType();
+        Descriptor listType = wellKnown.findFieldByName("items").getMessageType();
+        Descriptor emptyType = wellKnown.findFieldByName("marker").getMessageType();
+        Descriptor maskType = wellKnown.findFieldByName("mask").getMessageType();
+        Descriptor stringValueType = wellKnown.findFieldByName("label").getMessageType();
+        Descriptor entryType = structType.findFieldByName("fields").getMessageType();
+
+        DynamicMessage one =
+                DynamicMessage.newBuilder(valueType)
+                        .setField(valueType.findFieldByName("number_value"), 1d)
+                        .build();
+        DynamicMessage yes =
+                DynamicMessage.newBuilder(valueType)
+                        .setField(valueType.findFieldByName("bool_value"), true)
+                        .build();
+        DynamicMessage nothing =
+                DynamicMessage.newBuilder(valueType)
+                        .setField(
+                                valueType.findFieldByName("null_value"),
+                                valueType
+                                        .findFieldByName("null_value")
+                                        .getEnumType()
+                                        .findValueByNumber(0))
+                        .build();
+        DynamicMessage bList =
+                DynamicMessage.newBuilder(listType)
+                        .addRepeatedField(listType.findFieldByName("values"), yes)
+                        .addRepeatedField(listType.findFieldByName("values"), nothing)
+                        .build();
+        DynamicMessage b =
+                DynamicMessage.newBuilder(valueType)
+                        .setField(valueType.findFieldByName("list_value"), bList)
+                        .build();
+        DynamicMessage struct =
+                DynamicMessage.newBuilder(structType)
+                        .addRepeatedField(
+                                structType.findFieldByName("fields"), entry(entryType, "a", one))
+                        .addRepeatedField(
+                                structType.findFieldByName("fields"), entry(entryType, "b", b))
+                        .build();
+        DynamicMessage items =
+                DynamicMessage.newBuilder(listType)
+                        .addRepeatedField(
+                                listType.findFieldByName("values"),
+                                DynamicMessage.newBuilder(valueType)
+                                        .setField(valueType.findFieldByName("number_value"), 2.5d)
+                                        .build())
+                        .build();
+        return DynamicMessage.newBuilder(wellKnown)
+                .setField(
+                        wellKnown.findFieldByName("took"),
+                        DynamicMessage.newBuilder(durationType)
+                                .setField(durationType.findFieldByName("seconds"), 1L)
+                                .setField(durationType.findFieldByName("nanos"), 500000000)
+                                .build())
+                .setField(wellKnown.findFieldByName("attrs"), struct)
+                .setField(
+                        wellKnown.findFieldByName("any_value"),
+                        DynamicMessage.newBuilder(valueType)
+                                .setField(valueType.findFieldByName("string_value"), "x")
+                                .build())
+                .setField(wellKnown.findFieldByName("items"), items)
+                .setField(
+                        wellKnown.findFieldByName("marker"),
+                        DynamicMessage.newBuilder(emptyType).build())
+                .setField(
+                        wellKnown.findFieldByName("mask"),
+                        DynamicMessage.newBuilder(maskType)
+                                .addRepeatedField(maskType.findFieldByName("paths"), "a.b")
+                                .addRepeatedField(maskType.findFieldByName("paths"), "c")
+                                .build())
+                .setField(
+                        wellKnown.findFieldByName("label"),
+                        DynamicMessage.newBuilder(stringValueType)
+                                .setField(stringValueType.findFieldByName("value"), "hello")
+                                .build())
+                .build();
+    }
+
+    private static DynamicMessage entry(Descriptor entryType, String key, DynamicMessage value) {
+        return DynamicMessage.newBuilder(entryType)
+                .setField(entryType.findFieldByName("key"), key)
+                .setField(entryType.findFieldByName("value"), value)
+                .build();
     }
 
     /** A {@code test.Nested} with an embedded address. */
