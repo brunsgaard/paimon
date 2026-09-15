@@ -60,5 +60,14 @@ public class ProtobufOptions {
                             "Whether fields that are not set in a message produce their protobuf "
                                     + "default value. When false, unset fields produce NULL.");
 
+    public static final ConfigOption<Boolean> FLATTEN_NESTED_MESSAGES =
+            ConfigOptions.key("protobuf.flatten-nested-messages")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether singular message fields become one column per leaf, named "
+                                    + "'<field>_<leaf>', instead of a ROW column. Repeated and map "
+                                    + "fields keep their ROW element type.");
+
     private ProtobufOptions() {}
 }
