@@ -463,7 +463,8 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
                             identityOf,
                             evolution.dropMissingColumns());
                     // update column comment
-                    if (newField.description() != null) {
+                    if (newField.description() != null
+                            && !newField.description().equals(oldField.description())) {
                         result.add(
                                 SchemaChange.updateColumnComment(
                                         new String[] {newFieldName}, newField.description()));
