@@ -81,6 +81,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     private final IcebergOptions icebergOptions;
 
     private Table icebergTable;
+    /** Properties of the previous Iceberg table to set again after a recreate. */
+    @Nullable private Map<String, String> propertiesToRestore;
 
     public IcebergRestMetadataCommitter(FileStoreTable table) {
         Options options = new Options(table.options());
@@ -406,11 +408,24 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
     private Table recreateTable(TableMetadata newMetadata) {
         try {
+            propertiesToRestore = foreignProperties(icebergTable.properties());
             dropTable();
             return createTable(newMetadata);
         } catch (Exception e) {
             throw new RuntimeException("Fail to recreate iceberg table.", e);
         }
+    }
+
+    /** Properties set by others than this committer, kept across a recreate. */
+    static Map<String, String> foreignProperties(Map<String, String> properties) {
+        Map<String, String> foreign = new HashMap<>();
+        properties.forEach(
+                (key, value) -> {
+                    if (!key.startsWith("write.metadata.")) {
+                        foreign.put(key, value);
+                    }
+                });
+        return foreign;
     }
 
     // -------------------------------------------------------------------------------------
@@ -447,10 +462,15 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         boolean changed =
                 !desiredMax.equals(current.get(METADATA_PREVIOUS_VERSIONS_MAX))
                         || !desiredDeleteAfter.equals(
-                                current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED));
+                                current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED))
+                        || propertiesToRestore != null;
 
         if (changed) {
             Map<String, String> properties = new HashMap<>();
+            if (propertiesToRestore != null) {
+                properties.putAll(propertiesToRestore);
+                propertiesToRestore = null;
+            }
             properties.put(METADATA_PREVIOUS_VERSIONS_MAX, desiredMax);
             properties.put(METADATA_DELETE_AFTER_COMMIT_ENABLED, desiredDeleteAfter);
             update.setProperties(properties);
