@@ -172,6 +172,16 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                             "Iceberg table {} exists but has no snapshots, treating as new table.",
                             icebergTableIdentifier);
                     updateBuilder = updatesForCorrectBase(metadata, newMetadata, true);
+                } else if (newMetadata.currentSnapshot() != null
+                        && metadata.currentSnapshot().snapshotId()
+                                == newMetadata.currentSnapshot().snapshotId()) {
+                    // Paimon uses its snapshot id as the Iceberg snapshot id. The same id on both
+                    // sides means an earlier attempt committed and the response was lost.
+                    LOG.info(
+                            "Snapshot {} is already the current snapshot of {}, nothing to commit.",
+                            newMetadata.currentSnapshot().snapshotId(),
+                            icebergTableIdentifier);
+                    return;
                 } else {
                     boolean withBase = checkBase(metadata, newMetadata, baseIcebergMetadata);
                     if (withBase) {

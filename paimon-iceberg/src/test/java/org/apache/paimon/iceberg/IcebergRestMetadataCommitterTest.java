@@ -954,6 +954,50 @@ public class IcebergRestMetadataCommitterTest {
     }
 
     @Test
+    public void testCommittingTheSameSnapshotTwiceIsANoop() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        java.util.UUID uuidBefore = icebergTable.uuid();
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
+
+        // The commit of snapshot 2 landed but its response was lost: the committer is asked again.
+        FileIO fileIO = table.fileIO();
+        IcebergMetadata metadata2 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v2.metadata.json"));
+        IcebergMetadata metadata1 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v1.metadata.json"));
+        new IcebergRestMetadataCommitter(table).commitMetadata(metadata2, metadata1);
+
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.uuid()).isEqualTo(uuidBefore);
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(2);
+    }
+
+    @Test
     public void testCreateDatabaseIsIdempotentUnderRace() throws Exception {
         // Two commits targeting the same namespace can both observe it as missing and both
         // call createNamespace() (the check-then-act race in commitMetadataImpl). The loser
