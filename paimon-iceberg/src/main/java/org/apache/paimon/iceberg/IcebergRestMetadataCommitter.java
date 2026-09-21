@@ -827,12 +827,12 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
             }
         }
 
-        // if the iceberg table is existed, check whether the current metadata of the table is the
-        // base of the new table metadata, we use current snapshot id to check.
+        // The base is the last snapshot Paimon mirrored, which is the previous snapshot only when
+        // every job commits Iceberg metadata. The Iceberg table must sit on that base.
         // Note: callers must ensure currentMetadata.currentSnapshot() is non-null before calling
         // this method (guarded in commitMetadataImpl).
         return currentMetadata.currentSnapshot().snapshotId()
-                == newMetadata.currentSnapshot().snapshotId() - 1;
+                == baseIcebergMetadata.currentSnapshotId();
     }
 
     private IcebergMetadata adjustMetadataForRest(IcebergMetadata newIcebergMetadata) {
