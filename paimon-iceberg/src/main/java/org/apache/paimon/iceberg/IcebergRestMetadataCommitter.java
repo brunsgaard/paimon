@@ -40,6 +40,7 @@ import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -79,6 +80,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     private final String icebergDatabaseName;
     private final TableIdentifier icebergTableIdentifier;
     private final IcebergOptions icebergOptions;
+    /** The Paimon table location: the manifests and data files the mirror points at live here. */
+    private final String tableLocation;
 
     private Table icebergTable;
     /** Properties of the previous Iceberg table to set again after a recreate. */
@@ -87,6 +90,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     public IcebergRestMetadataCommitter(FileStoreTable table) {
         Options options = new Options(table.options());
         icebergOptions = new IcebergOptions(options);
+        tableLocation = table.location().toString();
 
         Identifier identifier = Preconditions.checkNotNull(table.catalogEnvironment().identifier());
         String icebergDatabase = options.get(IcebergOptions.METASTORE_DATABASE);
@@ -421,7 +425,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         Map<String, String> foreign = new HashMap<>();
         properties.forEach(
                 (key, value) -> {
-                    if (!key.startsWith("write.metadata.")) {
+                    if (!key.startsWith("write.metadata.")
+                            && !key.equals(TableProperties.WRITE_DATA_LOCATION)) {
                         foreign.put(key, value);
                     }
                 });
@@ -459,10 +464,13 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         String desiredDeleteAfter = String.valueOf(icebergOptions.deleteAfterCommitEnabled());
 
         Map<String, String> current = icebergTable.properties();
+        // write.data.path: the data and manifests are Paimon's, outside the Iceberg table
+        // location. A catalog that vends credentials scopes them from this property.
         boolean changed =
                 !desiredMax.equals(current.get(METADATA_PREVIOUS_VERSIONS_MAX))
                         || !desiredDeleteAfter.equals(
                                 current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED))
+                        || !tableLocation.equals(current.get(TableProperties.WRITE_DATA_LOCATION))
                         || propertiesToRestore != null;
 
         if (changed) {
@@ -473,6 +481,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
             }
             properties.put(METADATA_PREVIOUS_VERSIONS_MAX, desiredMax);
             properties.put(METADATA_DELETE_AFTER_COMMIT_ENABLED, desiredDeleteAfter);
+            properties.put(TableProperties.WRITE_DATA_LOCATION, tableLocation);
             update.setProperties(properties);
         }
     }

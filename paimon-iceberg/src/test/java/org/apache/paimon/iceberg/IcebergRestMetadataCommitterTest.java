@@ -46,6 +46,7 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.IcebergGenerics;
@@ -1018,6 +1019,8 @@ public class IcebergRestMetadataCommitterTest {
         commit.commit(1, write.prepareCommit(false, 1));
 
         Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties())
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
         java.util.UUID uuidBefore = icebergTable.uuid();
         // a property another tool set on the mirror
         icebergTable.updateProperties().set("bigquery.table", "p.d.t").commit();
@@ -1031,7 +1034,9 @@ public class IcebergRestMetadataCommitterTest {
 
         icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
         assertThat(icebergTable.uuid()).isNotEqualTo(uuidBefore);
-        assertThat(icebergTable.properties()).containsEntry("bigquery.table", "p.d.t");
+        assertThat(icebergTable.properties())
+                .containsEntry("bigquery.table", "p.d.t")
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
         assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
 
         write.close();
@@ -1043,6 +1048,7 @@ public class IcebergRestMetadataCommitterTest {
         Map<String, String> properties = new HashMap<>();
         properties.put("write.metadata.previous-versions-max", "5");
         properties.put("write.metadata.delete-after-commit.enabled", "true");
+        properties.put(TableProperties.WRITE_DATA_LOCATION, "file:/old");
         properties.put("write.parquet.compression-codec", "zstd");
         properties.put("bigquery.table", "p.d.t");
         properties.put("owner", "someone");
