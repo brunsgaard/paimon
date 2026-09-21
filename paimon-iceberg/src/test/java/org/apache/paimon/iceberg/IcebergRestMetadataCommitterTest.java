@@ -783,6 +783,7 @@ public class IcebergRestMetadataCommitterTest {
         Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
         // generate 3 metadata files in iceberg table, and current snapshot id is 3
         assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(3);
+        java.util.UUID uuidBefore = icebergTable.uuid();
 
         // disable iceberg compatibility
         Map<String, String> options = new HashMap<>();
@@ -819,9 +820,16 @@ public class IcebergRestMetadataCommitterTest {
                         "Record(4, 40)",
                         "Record(5, 50)",
                         "Record(6, 60)");
+        // Snapshots 4 and 5 were never mirrored. Snapshot 6 builds on the last mirrored snapshot,
+        // 3: same table, no recreate. Snapshot 7 builds on 6.
         icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
         assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(7);
-        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(2);
+        assertThat(icebergTable.uuid()).isEqualTo(uuidBefore);
+        assertThat(icebergTable.snapshot(6).parentId()).isEqualTo(3L);
+        assertThat(icebergTable.currentSnapshot().parentId()).isEqualTo(6L);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(5);
+        assertThat(icebergTable.properties())
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
 
         write.write(GenericRow.of(4, 41));
         write.compact(BinaryRow.EMPTY_ROW, 0, true);
@@ -955,50 +963,6 @@ public class IcebergRestMetadataCommitterTest {
     }
 
     @Test
-    public void testCommittingTheSameSnapshotTwiceIsANoop() throws Exception {
-        RowType rowType =
-                RowType.of(
-                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
-        FileStoreTable table =
-                createPaimonTable(
-                        rowType,
-                        Collections.emptyList(),
-                        Collections.singletonList("k"),
-                        1,
-                        randomFormat(),
-                        Collections.emptyMap());
-
-        String commitUser = UUID.randomUUID().toString();
-        TableWriteImpl<?> write = table.newWrite(commitUser);
-        TableCommitImpl commit = table.newCommit(commitUser);
-        write.write(GenericRow.of(1, 10));
-        commit.commit(1, write.prepareCommit(false, 1));
-        write.write(GenericRow.of(2, 20));
-        commit.commit(2, write.prepareCommit(false, 2));
-        write.close();
-        commit.close();
-
-        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
-        java.util.UUID uuidBefore = icebergTable.uuid();
-        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
-
-        // The commit of snapshot 2 landed but its response was lost: the committer is asked again.
-        FileIO fileIO = table.fileIO();
-        IcebergMetadata metadata2 =
-                IcebergMetadata.fromPath(
-                        fileIO, new Path(catalogTableMetadataPath(table), "v2.metadata.json"));
-        IcebergMetadata metadata1 =
-                IcebergMetadata.fromPath(
-                        fileIO, new Path(catalogTableMetadataPath(table), "v1.metadata.json"));
-        new IcebergRestMetadataCommitter(table).commitMetadata(metadata2, metadata1);
-
-        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
-        assertThat(icebergTable.uuid()).isEqualTo(uuidBefore);
-        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
-        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(2);
-    }
-
-    @Test
     public void testForeignPropertiesSurviveRecreate() throws Exception {
         RowType rowType =
                 RowType.of(
@@ -1041,6 +1005,50 @@ public class IcebergRestMetadataCommitterTest {
 
         write.close();
         commit.close();
+    }
+
+    @Test
+    public void testCommittingTheSameSnapshotTwiceIsANoop() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        java.util.UUID uuidBefore = icebergTable.uuid();
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
+
+        // The commit of snapshot 2 landed but its response was lost: the committer is asked again.
+        FileIO fileIO = table.fileIO();
+        IcebergMetadata metadata2 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v2.metadata.json"));
+        IcebergMetadata metadata1 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v1.metadata.json"));
+        new IcebergRestMetadataCommitter(table).commitMetadata(metadata2, metadata1);
+
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.uuid()).isEqualTo(uuidBefore);
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(2);
     }
 
     @Test

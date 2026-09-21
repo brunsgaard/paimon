@@ -40,6 +40,7 @@ import org.apache.paimon.iceberg.manifest.IcebergManifestFileMeta;
 import org.apache.paimon.iceberg.manifest.IcebergManifestList;
 import org.apache.paimon.iceberg.metadata.IcebergMetadata;
 import org.apache.paimon.iceberg.metadata.IcebergRef;
+import org.apache.paimon.iceberg.metadata.IcebergSnapshot;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
@@ -95,6 +96,7 @@ import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.iceberg.IcebergCommitCallback.catalogTableMetadataPath;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -1075,6 +1077,11 @@ public class IcebergCompatibilityTest {
         commit.commit(2, write.prepareCommit(true, 2));
         assertThat(getIcebergResult())
                 .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+        String uuidBefore =
+                IcebergMetadata.fromPath(
+                                table.fileIO(),
+                                new Path(catalogTableMetadataPath(table), "v3.metadata.json"))
+                        .tableUuid();
 
         // disable iceberg compatibility
         Map<String, String> options = new HashMap<>();
@@ -1114,8 +1121,207 @@ public class IcebergCompatibilityTest {
                         "Record(5, 50)",
                         "Record(6, 60)");
 
+        // Snapshots 4 and 5 have no Iceberg metadata. Snapshot 6 builds on the last mirrored
+        // snapshot, 3, instead of starting the Iceberg table over; 7 builds on 6.
+        IcebergMetadata metadata6 =
+                IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new Path(catalogTableMetadataPath(table), "v6.metadata.json"));
+        IcebergMetadata metadata7 =
+                IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new Path(catalogTableMetadataPath(table), "v7.metadata.json"));
+        assertThat(metadata7.tableUuid()).isEqualTo(uuidBefore);
+        assertThat(metadata6.currentSnapshot().parentSnapshotId()).isEqualTo(3L);
+        assertThat(metadata7.snapshots().stream().map(IcebergSnapshot::snapshotId))
+                .containsExactly(1L, 2L, 3L, 6L, 7L);
+        assertThat(metadata7.currentSnapshot().parentSnapshotId()).isEqualTo(6L);
+
         write.close();
         commit.close();
+    }
+
+    @Test
+    public void testOnlyTheCopyWithMirrorOptionsCommitsIcebergMetadata() throws Exception {
+        // The writer's table has no metadata.iceberg.* options. The compaction job passes them as
+        // dynamic options, so only its table copy creates the Iceberg commit callback, and its
+        // snapshots build on the last mirrored snapshot across the writer's unmirrored ones.
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> noMirror = new HashMap<>();
+        noMirror.put(
+                IcebergOptions.METADATA_ICEBERG_STORAGE.key(),
+                IcebergOptions.StorageType.DISABLED.toString());
+        FileStoreTable writerTable =
+                createPaimonTable(
+                                rowType,
+                                Collections.emptyList(),
+                                Collections.singletonList("k"),
+                                1,
+                                Collections.emptyMap())
+                        .copy(noMirror);
+        Map<String, String> mirror = new HashMap<>();
+        mirror.put(
+                IcebergOptions.METADATA_ICEBERG_STORAGE.key(),
+                IcebergOptions.StorageType.TABLE_LOCATION.toString());
+        FileStoreTable compactorTable = writerTable.copy(mirror);
+        Path metadataDir = catalogTableMetadataPath(compactorTable);
+
+        // the writer: two appends, no Iceberg metadata
+        String writer = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = writerTable.newWrite(writer);
+        TableCommitImpl commit = writerTable.newCommit(writer);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+        assertThat(writerTable.snapshotManager().latestSnapshotId()).isEqualTo(2L);
+        assertThat(writerTable.fileIO().exists(metadataDir)).isFalse();
+
+        // the compaction job: its snapshot 3 is the first mirrored one
+        String compactor = UUID.randomUUID().toString();
+        write = compactorTable.newWrite(compactor);
+        commit = compactorTable.newCommit(compactor);
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.close();
+        commit.close();
+        assertThat(compactorTable.snapshotManager().latestSnapshotId()).isEqualTo(3L);
+        assertThat(writerTable.fileIO().exists(new Path(metadataDir, "v3.metadata.json"))).isTrue();
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        // the writer appends 4 and 5 without metadata; the compaction job mirrors 6 on base 3
+        write = writerTable.newWrite(writer);
+        commit = writerTable.newCommit(writer);
+        write.write(GenericRow.of(3, 30));
+        commit.commit(3, write.prepareCommit(false, 3));
+        write.write(GenericRow.of(1, 11));
+        commit.commit(4, write.prepareCommit(false, 4));
+        write.close();
+        commit.close();
+        write = compactorTable.newWrite(compactor);
+        commit = compactorTable.newCommit(compactor);
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        write.close();
+        commit.close();
+        assertThat(compactorTable.snapshotManager().latestSnapshotId()).isEqualTo(6L);
+        assertThat(writerTable.fileIO().exists(new Path(metadataDir, "v4.metadata.json")))
+                .isFalse();
+        assertThat(writerTable.fileIO().exists(new Path(metadataDir, "v5.metadata.json")))
+                .isFalse();
+        IcebergMetadata metadata6 =
+                IcebergMetadata.fromPath(
+                        writerTable.fileIO(), new Path(metadataDir, "v6.metadata.json"));
+        assertThat(metadata6.snapshots().stream().map(IcebergSnapshot::snapshotId))
+                .containsExactly(3L, 6L);
+        assertThat(metadata6.currentSnapshot().parentSnapshotId()).isEqualTo(3L);
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+    }
+
+    @Test
+    public void testCompactorSnapshotWithoutNewTopLevelFilesKeepsTheMirroredFiles()
+            throws Exception {
+        // A primary key table exposes only its top-level files to Iceberg. When the compaction
+        // job mirrors a snapshot whose bucket also holds level 0 files, the bucket is not raw
+        // convertible, so the mirror must be built from the live top-level files of the snapshot,
+        // not from raw convertible data splits, or it comes out empty.
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> noMirror = new HashMap<>();
+        noMirror.put(
+                IcebergOptions.METADATA_ICEBERG_STORAGE.key(),
+                IcebergOptions.StorageType.DISABLED.toString());
+        FileStoreTable writerTable =
+                createPaimonTable(
+                                rowType,
+                                Collections.emptyList(),
+                                Collections.singletonList("k"),
+                                1,
+                                Collections.emptyMap())
+                        .copy(noMirror);
+        Map<String, String> mirror = new HashMap<>();
+        mirror.put(
+                IcebergOptions.METADATA_ICEBERG_STORAGE.key(),
+                IcebergOptions.StorageType.TABLE_LOCATION.toString());
+        FileStoreTable compactorTable = writerTable.copy(mirror);
+        Path metadataDir = catalogTableMetadataPath(compactorTable);
+
+        // writer: snapshots 1 and 2, no mirror; compaction job: full compaction, snapshot 3
+        // mirrored
+        String writer = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = writerTable.newWrite(writer);
+        TableCommitImpl commit = writerTable.newCommit(writer);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+        String compactor = UUID.randomUUID().toString();
+        write = compactorTable.newWrite(compactor);
+        commit = compactorTable.newCommit(compactor);
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.close();
+        commit.close();
+        assertThat(compactorTable.snapshotManager().latestSnapshotId()).isEqualTo(3L);
+        IcebergMetadata metadata3 =
+                IcebergMetadata.fromPath(
+                        writerTable.fileIO(), new Path(metadataDir, "v3.metadata.json"));
+        assertThat(metadata3.currentSnapshot().summary().get("total-data-files")).isEqualTo("1");
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        // writer: snapshot 4 at level 0, no mirror; compaction job: snapshot 5 with no new
+        // top-level file (an append of its own), mirrored on base 3
+        write = writerTable.newWrite(writer);
+        commit = writerTable.newCommit(writer);
+        write.write(GenericRow.of(3, 30));
+        commit.commit(3, write.prepareCommit(false, 3));
+        write.close();
+        commit.close();
+        write = compactorTable.newWrite(compactor);
+        commit = compactorTable.newCommit(compactor);
+        write.write(GenericRow.of(4, 40));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+        assertThat(compactorTable.snapshotManager().latestSnapshotId()).isEqualTo(5L);
+        assertThat(writerTable.fileIO().exists(new Path(metadataDir, "v4.metadata.json")))
+                .isFalse();
+        IcebergMetadata metadata5 =
+                IcebergMetadata.fromPath(
+                        writerTable.fileIO(), new Path(metadataDir, "v5.metadata.json"));
+        assertThat(metadata5.currentSnapshot().parentSnapshotId()).isEqualTo(3L);
+        // the top-level file of snapshot 3 is still the whole mirror: same files, same rows
+        assertThat(metadata5.currentSnapshot().summary().get("total-data-files")).isEqualTo("1");
+        assertThat(metadata5.currentSnapshot().summary().get("added-data-files")).isEqualTo("0");
+        assertThat(metadata5.currentSnapshot().summary().get("deleted-data-files")).isEqualTo("0");
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        // compaction job: full compaction, snapshot 6 replaces the top-level file, all rows visible
+        write = compactorTable.newWrite(compactor);
+        commit = compactorTable.newCommit(compactor);
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        write.close();
+        commit.close();
+        assertThat(compactorTable.snapshotManager().latestSnapshotId()).isEqualTo(6L);
+        IcebergMetadata metadata6 =
+                IcebergMetadata.fromPath(
+                        writerTable.fileIO(), new Path(metadataDir, "v6.metadata.json"));
+        assertThat(metadata6.currentSnapshot().parentSnapshotId()).isEqualTo(5L);
+        // The summary of a snapshot built on the previous one counts every Paimon file the
+        // compaction removed, level 0 files included, so its totals are not checked here; the
+        // manifests are.
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 10)", "Record(2, 20)", "Record(3, 30)", "Record(4, 40)");
     }
 
     /*
