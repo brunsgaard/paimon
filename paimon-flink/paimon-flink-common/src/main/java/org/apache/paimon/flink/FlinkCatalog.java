@@ -1045,6 +1045,45 @@ public class FlinkCatalog extends AbstractCatalog {
                 nonPhysicalColumnComments);
     }
 
+    /**
+     * Flink 2.3 split the definition query into an original and an expanded query and requires
+     * the original one; {@code definitionQuery} only sets the expanded query there. Paimon stores
+     * one query, so it serves as both. Older Flink versions have no {@code originalQuery}.
+     */
+    private static CatalogMaterializedTable.Builder withDefinitionQuery(
+            CatalogMaterializedTable.Builder builder, String definitionQuery) {
+        try {
+            builder.getClass()
+                    .getMethod("originalQuery", String.class)
+                    .invoke(builder, definitionQuery);
+        } catch (NoSuchMethodException e) {
+            // Flink before 2.3
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+        return builder.definitionQuery(definitionQuery);
+    }
+
+    /**
+     * Flink 2.3 replaced {@code IntervalFreshness.TimeUnit} with {@code Interval.TimeUnit}. The
+     * unit factories exist in every Flink version this module compiles against.
+     */
+    private static IntervalFreshness toIntervalFreshness(
+            String interval, CoreOptions.MaterializedTableIntervalFreshnessTimeUnit unit) {
+        switch (unit) {
+            case SECOND:
+                return IntervalFreshness.ofSecond(interval);
+            case MINUTE:
+                return IntervalFreshness.ofMinute(interval);
+            case HOUR:
+                return IntervalFreshness.ofHour(interval);
+            case DAY:
+                return IntervalFreshness.ofDay(interval);
+            default:
+                throw new IllegalArgumentException("Unsupported freshness time unit: " + unit);
+        }
+    }
+
     private CatalogMaterializedTable buildMaterializedTable(
             Table table,
             Map<String, String> newOptions,
@@ -1052,11 +1091,9 @@ public class FlinkCatalog extends AbstractCatalog {
             Options options) {
         String definitionQuery = options.get(MATERIALIZED_TABLE_DEFINITION_QUERY);
         IntervalFreshness freshness =
-                IntervalFreshness.of(
+                toIntervalFreshness(
                         options.get(MATERIALIZED_TABLE_INTERVAL_FRESHNESS),
-                        IntervalFreshness.TimeUnit.valueOf(
-                                options.get(MATERIALIZED_TABLE_INTERVAL_FRESHNESS_TIME_UNIT)
-                                        .name()));
+                        options.get(MATERIALIZED_TABLE_INTERVAL_FRESHNESS_TIME_UNIT));
         CatalogMaterializedTable.LogicalRefreshMode logicalRefreshMode =
                 CatalogMaterializedTable.LogicalRefreshMode.valueOf(
                         options.get(MATERIALIZED_TABLE_LOGICAL_REFRESH_MODE).name());
@@ -1072,12 +1109,13 @@ public class FlinkCatalog extends AbstractCatalog {
                 decodeRefreshHandlerBytes(options.get(MATERIALIZED_TABLE_REFRESH_HANDLER_BYTES));
         // remove materialized table related options
         allMaterializedTableAttributes().forEach(newOptions::remove);
-        return CatalogMaterializedTable.newBuilder()
-                .schema(schema)
-                .comment(table.comment().orElse(""))
-                .partitionKeys(table.partitionKeys())
-                .options(newOptions)
-                .definitionQuery(definitionQuery)
+        CatalogMaterializedTable.Builder builder =
+                CatalogMaterializedTable.newBuilder()
+                        .schema(schema)
+                        .comment(table.comment().orElse(""))
+                        .partitionKeys(table.partitionKeys())
+                        .options(newOptions);
+        return withDefinitionQuery(builder, definitionQuery)
                 .freshness(freshness)
                 .logicalRefreshMode(logicalRefreshMode)
                 .refreshMode(refreshMode)
