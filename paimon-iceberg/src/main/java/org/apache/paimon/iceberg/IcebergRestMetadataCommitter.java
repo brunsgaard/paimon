@@ -26,6 +26,8 @@ import org.apache.paimon.iceberg.metadata.IcebergMetadata;
 import org.apache.paimon.iceberg.metadata.IcebergSchema;
 import org.apache.paimon.iceberg.metadata.IcebergSnapshot;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.Preconditions;
 
@@ -96,6 +98,9 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     /** The Paimon table location: the manifests and data files the mirror points at live here. */
     private final String tableLocation;
 
+    /** The Paimon table's schema history: every custom property it ever set is not foreign. */
+    private final SchemaManager schemaManager;
+
     private Table icebergTable;
     /** Properties of the previous Iceberg table to set again after a recreate. */
     @Nullable private Map<String, String> propertiesToRestore;
@@ -116,6 +121,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 IcebergOptions.UNKNOWN_HOST_RETRY_INITIAL_DELAY_MILLIS.key());
         this.fileIO = table.fileIO();
         this.metadataDirectory = IcebergCommitCallback.catalogTableMetadataPath(table);
+        this.schemaManager = table.schemaManager();
         tableLocation = table.location().toString();
 
         Identifier identifier = Preconditions.checkNotNull(table.catalogEnvironment().identifier());
@@ -672,7 +678,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
     private Table recreateTable(TableMetadata newMetadata) {
         try {
-            propertiesToRestore = foreignProperties(icebergTable.properties());
+            captureForeignProperties();
             dropTable();
             return createTable(newMetadata);
         } catch (Exception e) {
@@ -691,16 +697,52 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     }
 
     /** Properties set by others than this committer, kept across a recreate. */
-    static Map<String, String> foreignProperties(Map<String, String> properties) {
+    /** Properties this committer writes itself and derives again after a recreate. */
+    private static boolean isOwnedProperty(String key) {
+        return key.startsWith("write.metadata.") || key.equals(TableProperties.WRITE_DATA_LOCATION);
+    }
+
+    /**
+     * Properties set by others than this committer, kept across a recreate. The custom properties
+     * of the Paimon table are not foreign: the recreate writes their current values, and one the
+     * owner removed must not come back from the old catalog entry, so {@code customKeys} holds
+     * every custom key the table's schema history ever set.
+     */
+    static Map<String, String> foreignProperties(
+            Map<String, String> catalogProperties, Set<String> customKeys) {
         Map<String, String> foreign = new HashMap<>();
-        properties.forEach(
+        catalogProperties.forEach(
                 (key, value) -> {
-                    if (!key.startsWith("write.metadata.")
-                            && !key.equals(TableProperties.WRITE_DATA_LOCATION)) {
+                    if (!isOwnedProperty(key) && !customKeys.contains(key)) {
                         foreign.put(key, value);
                     }
                 });
         return foreign;
+    }
+
+    /** Every custom property key the Paimon table's schema history ever set. */
+    private Set<String> historicalCustomKeys() {
+        Set<String> customKeys = new HashSet<>(customTableProperties().keySet());
+        for (TableSchema schema : schemaManager.listAll()) {
+            for (String key : schema.options().keySet()) {
+                if (key.startsWith(IcebergOptions.TABLE_PROPERTIES_PREFIX)) {
+                    customKeys.add(key.substring(IcebergOptions.TABLE_PROPERTIES_PREFIX.length()));
+                }
+            }
+        }
+        return customKeys;
+    }
+
+    /** Remembers the foreign properties of the catalog entry that is about to be dropped. */
+    private void captureForeignProperties() {
+        propertiesToRestore = foreignProperties(icebergTable.properties(), historicalCustomKeys());
+        if (!propertiesToRestore.isEmpty()) {
+            LOG.info(
+                    "Carrying {} foreign properties across the recreate of {}: {}",
+                    propertiesToRestore.size(),
+                    icebergTableIdentifier,
+                    propertiesToRestore);
+        }
     }
 
     // -------------------------------------------------------------------------------------
@@ -755,6 +797,16 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 changed = true;
                 break;
             }
+        }
+        // a custom property the owner removed from the Paimon table leaves the catalog entry too
+        Set<String> removedCustom = new HashSet<>();
+        for (String key : historicalCustomKeys()) {
+            if (!customProperties.containsKey(key) && current.containsKey(key)) {
+                removedCustom.add(key);
+            }
+        }
+        if (!removedCustom.isEmpty()) {
+            update.removeProperties(removedCustom);
         }
 
         if (changed) {

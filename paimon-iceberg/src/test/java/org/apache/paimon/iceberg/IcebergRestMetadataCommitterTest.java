@@ -1441,8 +1441,109 @@ public class IcebergRestMetadataCommitterTest {
         properties.put("write.parquet.compression-codec", "zstd");
         properties.put("sync.pointer", "p.d.t");
         properties.put("owner", "someone");
-        assertThat(IcebergRestMetadataCommitter.foreignProperties(properties))
+        assertThat(
+                        IcebergRestMetadataCommitter.foreignProperties(
+                                properties, Collections.emptySet()))
                 .containsOnlyKeys("write.parquet.compression-codec", "sync.pointer", "owner");
+    }
+
+    @Test
+    public void testForeignPropertiesExcludeOwnedAndCurrentCustomKeys() {
+        Map<String, String> catalogProperties = new LinkedHashMap<>();
+        catalogProperties.put("write.metadata.previous-versions-max", "1000");
+        catalogProperties.put("write.metadata.delete-after-commit.enabled", "true");
+        catalogProperties.put(TableProperties.WRITE_DATA_LOCATION, "file:/t");
+        catalogProperties.put("write.parquet.compression-codec", "zstd");
+        catalogProperties.put("sync.pointer", "p.d.t");
+        catalogProperties.put("owner", "a");
+        Set<String> customKeys = new HashSet<>(Arrays.asList("write.parquet.compression-codec"));
+
+        Map<String, String> foreign =
+                IcebergRestMetadataCommitter.foreignProperties(catalogProperties, customKeys);
+
+        assertThat(foreign).containsOnlyKeys("sync.pointer", "owner");
+    }
+
+    @Test
+    public void testRemovedCustomPropertyDoesNotReturnAfterRecreate() throws Exception {
+        FileStoreTable table = tableWithComment("first");
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.close();
+        commit.close();
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).containsEntry("comment", "first");
+
+        // a foreign snapshot makes the base incorrect, so the next commit recreates the table;
+        // the owner has removed the custom property by then
+        icebergTable.newAppend().commit();
+        table = withoutComment(table);
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(2, 20));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        write.close();
+        commit.close();
+
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).doesNotContainKey("comment");
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+    }
+
+    @Test
+    public void testRemovedCustomPropertyIsRemovedOnTheUpdatePath() throws Exception {
+        FileStoreTable table = tableWithComment("first");
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.close();
+        commit.close();
+        assertThat(restCatalog.loadTable(TableIdentifier.of("mydb", "t")).properties())
+                .containsEntry("comment", "first");
+
+        table = withoutComment(table);
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(2, 20));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        write.close();
+        commit.close();
+
+        assertThat(restCatalog.loadTable(TableIdentifier.of("mydb", "t")).properties())
+                .doesNotContainKey("comment");
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+    }
+
+    private FileStoreTable tableWithComment(String comment) throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "comment", comment);
+        return createPaimonTable(
+                rowType,
+                Collections.emptyList(),
+                Collections.singletonList("k"),
+                1,
+                randomFormat(),
+                customOptions);
+    }
+
+    private FileStoreTable withoutComment(FileStoreTable table) throws Exception {
+        table.schemaManager()
+                .commitChanges(
+                        SchemaChange.removeOption(
+                                IcebergOptions.TABLE_PROPERTIES_PREFIX + "comment"));
+        return table.copy(table.schemaManager().latest().get());
     }
 
     @Test
