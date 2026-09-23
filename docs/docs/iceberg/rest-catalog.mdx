@@ -140,6 +140,10 @@ Recovery can remove and recreate the REST catalog entry. Removal uses non-purgin
 does not delete the shared data files. Some v3 recovery paths must register a metadata file directly
 to preserve row IDs; Paimon checks the service's registration support before removing the existing entry.
 
+The committer sets `write.data.path` on the Iceberg table to the Paimon table location, so a
+catalog that vends credentials scopes them to the data files. Data files under Paimon external
+paths are outside that scope.
+
 Keep writes and table maintenance in Paimon. Independent changes through the Iceberg catalog can
 conflict with later publication and be replaced during recovery.
 

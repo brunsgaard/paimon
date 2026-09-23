@@ -26,6 +26,8 @@ import org.apache.paimon.iceberg.metadata.IcebergMetadata;
 import org.apache.paimon.iceberg.metadata.IcebergSchema;
 import org.apache.paimon.iceberg.metadata.IcebergSnapshot;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.Preconditions;
 
@@ -46,6 +48,8 @@ import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.rest.Endpoint;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.types.Types;
@@ -93,8 +97,17 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     private final IcebergOptions icebergOptions;
     private final int unknownHostMaxRetries;
     private final long unknownHostInitialRetryDelayMillis;
+    /** The Paimon table location: the manifests and data files the mirror points at live here. */
+    private final String tableLocation;
+
+    /** The Paimon table's schema history: every custom property it ever set is not foreign. */
+    private final SchemaManager schemaManager;
 
     private Table icebergTable;
+    /** Properties of the previous Iceberg table to set again after a recreate. */
+    @Nullable private Map<String, String> propertiesToRestore;
+
+    @Nullable private Set<String> historicalCustomKeys;
 
     public IcebergRestMetadataCommitter(FileStoreTable table) {
         Options options = new Options(table.options());
@@ -112,6 +125,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 IcebergOptions.UNKNOWN_HOST_RETRY_INITIAL_DELAY_MILLIS.key());
         this.fileIO = table.fileIO();
         this.metadataDirectory = IcebergCommitCallback.catalogTableMetadataPath(table);
+        this.schemaManager = table.schemaManager();
+        tableLocation = table.location().toString();
 
         Identifier identifier = Preconditions.checkNotNull(table.catalogEnvironment().identifier());
         String icebergDatabase = options.get(IcebergOptions.METASTORE_DATABASE);
@@ -211,6 +226,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
         // updates to be committed
         TableMetadata.Builder updateBuilder;
+        boolean reconciled = false;
 
         // create database if not exist
         if (!databaseExists()) {
@@ -250,6 +266,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                             "Iceberg table {} is already at snapshot {}, nothing to commit.",
                             icebergTableIdentifier,
                             newCurrent.snapshotId());
+                    // a property commit that failed after the snapshot commit is repaired here
+                    commitPropertiesIfChanged();
                     return;
                 }
 
@@ -276,6 +294,28 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                     if (withBase) {
                         LOG.info("create updates with base metadata.");
                         updateBuilder = updatesForCorrectBase(metadata, newMetadata, false);
+                    } else if (!requiresRegistration(newIcebergMetadata)
+                            && canReconcile(metadata, newMetadata)) {
+                        LOG.info(
+                                "Iceberg table {} is at snapshot {} instead of base {};"
+                                        + " reconciling in place.",
+                                icebergTableIdentifier,
+                                metadata.currentSnapshot().snapshotId(),
+                                baseIcebergMetadata == null
+                                        ? "none"
+                                        : baseIcebergMetadata.currentSnapshotId());
+                        try {
+                            updateBuilder = updatesForCorrectBase(metadata, newMetadata, false);
+                            reconciled = true;
+                        } catch (ValidationException e) {
+                            // Iceberg refused the update while it was built; recreate as before
+                            LOG.warn(
+                                    "Reconciling Iceberg table {} in place is not possible,"
+                                            + " recreating it.",
+                                    icebergTableIdentifier,
+                                    e);
+                            updateBuilder = updatesForIncorrectBase(newMetadata);
+                        }
                     } else {
                         LOG.info(
                                 "create updates without base metadata. currentSnapshotId for base metadata: {}, for new metadata:{}",
@@ -309,11 +349,81 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
             ((BaseTable) icebergTable)
                     .operations()
                     .commit(((BaseTable) icebergTable).operations().current(), updatedForCommit);
+        } catch (CommitFailedException | ValidationException e) {
+            if (!reconciled) {
+                throw new RuntimeException(
+                        "Fail to commit metadata to rest catalog for table: "
+                                + icebergTableIdentifier,
+                        e);
+            }
+            // the server refused the reconciled update; recreate as before
+            LOG.warn(
+                    "Reconciling Iceberg table {} in place was refused, recreating it.",
+                    icebergTableIdentifier,
+                    e);
+            TableMetadata recreated = updatesForIncorrectBase(newMetadata).build();
+            try {
+                ((BaseTable) icebergTable)
+                        .operations()
+                        .commit(((BaseTable) icebergTable).operations().current(), recreated);
+            } catch (Exception retry) {
+                throw new RuntimeException(
+                        "Fail to commit metadata to rest catalog for table: "
+                                + icebergTableIdentifier,
+                        retry);
+            }
         } catch (Exception e) {
             throw new RuntimeException(
                     "Fail to commit metadata to rest catalog for table: " + icebergTableIdentifier,
                     e);
         }
+    }
+
+    /**
+     * Whether the catalog table can be moved to {@code newMetadata} with updates instead of a
+     * recreate. The new metadata must continue the catalog's lineage: every snapshot id both sides
+     * know must be the same Paimon commit, otherwise the catalog would keep a snapshot of an
+     * abandoned timeline under a live id. The table uuid is no lineage check: the catalog assigns
+     * its own at create. Iceberg requires sequence numbers to increase, refuses a snapshot id it
+     * already has and a format downgrade, and keeps one schema per id, so those are the other
+     * conditions.
+     */
+    static boolean canReconcile(TableMetadata catalog, TableMetadata newMetadata) {
+        Snapshot newCurrent = newMetadata.currentSnapshot();
+        if (newCurrent == null || newMetadata.formatVersion() < catalog.formatVersion()) {
+            return false;
+        }
+        if (catalog.formatVersion() > 1
+                && newCurrent.sequenceNumber() <= catalog.lastSequenceNumber()) {
+            return false;
+        }
+        if (catalog.snapshot(newCurrent.snapshotId()) != null) {
+            return false;
+        }
+        // row lineage: a rebuilt snapshot may start its row ids below the catalog's watermark
+        if (newMetadata.formatVersion() >= 3
+                && catalog.nextRowId() > 0
+                && newCurrent.firstRowId() != null
+                && newCurrent.firstRowId() < catalog.nextRowId()) {
+            return false;
+        }
+        for (Snapshot snapshot : newMetadata.snapshots()) {
+            Snapshot known = catalog.snapshot(snapshot.snapshotId());
+            if (known != null
+                    && !java.util.Objects.equals(
+                            known.summary().get(PAIMON_COMMIT_IDENTITY),
+                            snapshot.summary().get(PAIMON_COMMIT_IDENTITY))) {
+                return false;
+            }
+        }
+        for (Schema schema : newMetadata.schemas()) {
+            Schema existing = catalog.schemasById().get(schema.schemaId());
+            if (existing != null && !existing.sameSchema(schema)) {
+                return false;
+            }
+        }
+        return newMetadata.currentSchemaId() > catalog.currentSchemaId()
+                || catalog.schemasById().containsKey(newMetadata.currentSchemaId());
     }
 
     private TableMetadata.Builder updatesForCorrectBase(
@@ -448,19 +558,39 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 if (probeRegisterTable(registerPath)) {
                     // the table disappeared concurrently and the probe registered it
                     verifyRegistered(newMetadata);
+                    commitPropertiesIfChanged();
                     return;
                 }
+                captureForeignProperties();
                 dropTable();
             }
             icebergTable =
                     restCatalog.registerTable(icebergTableIdentifier, registerPath.toString());
             verifyRegistered(newMetadata);
+            commitPropertiesIfChanged();
         } catch (UnsupportedOperationException e) {
             throw e;
         } catch (Exception e) {
             throw new RuntimeException(
                     "Fail to register iceberg table " + icebergTableIdentifier, e);
         }
+    }
+
+    /**
+     * Applies the committer's properties to a registered table when they differ from it. A
+     * registration imports the metadata file as it is, so write.data.path, the metadata retention
+     * settings, the custom properties and the properties carried across a drop are set here.
+     */
+    private void commitPropertiesIfChanged() {
+        TableMetadata current = ((BaseTable) icebergTable).operations().current();
+        TableMetadata.Builder update = TableMetadata.buildFrom(current);
+        updateProperties(update);
+        TableMetadata updated = update.build();
+        if (updated.changes().isEmpty()) {
+            return;
+        }
+        ((BaseTable) icebergTable).operations().commit(current, updated);
+        icebergTable = getTable();
     }
 
     /**
@@ -667,6 +797,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
     private Table recreateTable(TableMetadata newMetadata) {
         try {
+            captureForeignProperties();
             dropTable();
             return createTable(newMetadata);
         } catch (Exception e) {
@@ -684,9 +815,65 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         restCatalog.dropTable(icebergTableIdentifier, false);
     }
 
+    /** Properties set by others than this committer, kept across a recreate. */
     @Override
     public void close() throws IOException {
         restCatalog.close();
+    }
+
+    /** Properties this committer writes itself and derives again after a recreate. */
+    private static boolean isOwnedProperty(String key) {
+        return key.startsWith("write.metadata.") || key.equals(TableProperties.WRITE_DATA_LOCATION);
+    }
+
+    /**
+     * Properties set by others than this committer, kept across a recreate. The custom properties
+     * of the Paimon table are not foreign: the recreate writes their current values, and one the
+     * owner removed must not come back from the old catalog entry, so {@code customKeys} holds
+     * every custom key the table's schema history ever set.
+     */
+    static Map<String, String> foreignProperties(
+            Map<String, String> catalogProperties, Set<String> customKeys) {
+        Map<String, String> foreign = new HashMap<>();
+        catalogProperties.forEach(
+                (key, value) -> {
+                    if (!isOwnedProperty(key) && !customKeys.contains(key)) {
+                        foreign.put(key, value);
+                    }
+                });
+        return foreign;
+    }
+
+    /**
+     * Every custom property key the Paimon table's schema history ever set. Read once per
+     * committer: a schema change rebuilds the callback and with it this committer.
+     */
+    private Set<String> historicalCustomKeys() {
+        if (historicalCustomKeys == null) {
+            Set<String> customKeys = new HashSet<>(customTableProperties().keySet());
+            for (TableSchema schema : schemaManager.listAll()) {
+                for (String key : schema.options().keySet()) {
+                    if (key.startsWith(IcebergOptions.TABLE_PROPERTIES_PREFIX)) {
+                        customKeys.add(
+                                key.substring(IcebergOptions.TABLE_PROPERTIES_PREFIX.length()));
+                    }
+                }
+            }
+            historicalCustomKeys = customKeys;
+        }
+        return historicalCustomKeys;
+    }
+
+    /** Remembers the foreign properties of the catalog entry that is about to be dropped. */
+    private void captureForeignProperties() {
+        propertiesToRestore = foreignProperties(icebergTable.properties(), historicalCustomKeys());
+        if (!propertiesToRestore.isEmpty()) {
+            LOG.info(
+                    "Carrying {} foreign properties across the recreate of {}: {}",
+                    propertiesToRestore.size(),
+                    icebergTableIdentifier,
+                    propertiesToRestore);
+        }
     }
 
     // -------------------------------------------------------------------------------------
@@ -726,10 +913,14 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         String desiredDeleteAfter = String.valueOf(icebergOptions.deleteAfterCommitEnabled());
 
         Map<String, String> current = icebergTable.properties();
+        // write.data.path: the data and manifests are Paimon's, outside the Iceberg table
+        // location. A catalog that vends credentials scopes them from this property.
         boolean changed =
                 !desiredMax.equals(current.get(METADATA_PREVIOUS_VERSIONS_MAX))
                         || !desiredDeleteAfter.equals(
-                                current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED));
+                                current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED))
+                        || !tableLocation.equals(current.get(TableProperties.WRITE_DATA_LOCATION))
+                        || propertiesToRestore != null;
 
         Map<String, String> customProperties = customTableProperties();
         for (Map.Entry<String, String> entry : customProperties.entrySet()) {
@@ -738,12 +929,27 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 break;
             }
         }
+        // a custom property the owner removed from the Paimon table leaves the catalog entry too
+        Set<String> removedCustom = new HashSet<>();
+        for (String key : historicalCustomKeys()) {
+            if (!customProperties.containsKey(key) && current.containsKey(key)) {
+                removedCustom.add(key);
+            }
+        }
+        if (!removedCustom.isEmpty()) {
+            update.removeProperties(removedCustom);
+        }
 
         if (changed) {
             Map<String, String> properties = new HashMap<>();
+            if (propertiesToRestore != null) {
+                properties.putAll(propertiesToRestore);
+                propertiesToRestore = null;
+            }
             properties.put(METADATA_PREVIOUS_VERSIONS_MAX, desiredMax);
             properties.put(METADATA_DELETE_AFTER_COMMIT_ENABLED, desiredDeleteAfter);
             properties.putAll(customProperties);
+            properties.put(TableProperties.WRITE_DATA_LOCATION, tableLocation);
             update.setProperties(properties);
         }
     }
