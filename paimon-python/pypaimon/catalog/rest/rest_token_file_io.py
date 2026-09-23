@@ -57,6 +57,8 @@ class RESTTokenFileIO(FileIO):
             # Assume it's already an Options object
             self.catalog_options = catalog_options
         self.properties = self.catalog_options or Options({})  # For compatibility with refresh_token()
+        self.expiration_safe_time_millis = int(
+            self.properties.get(CatalogOptions.DATA_TOKEN_EXPIRATION_SAFE_TIME).total_seconds() * 1000)
         self.token: Optional[RESTToken] = None
         self.api_instance: Optional[RESTApi] = None
         self.log = logging.getLogger(__name__)
@@ -243,7 +245,7 @@ class RESTTokenFileIO(FileIO):
         if token is None:
             return True
         current_time = int(time.time() * 1000)
-        return (token.expire_at_millis - current_time) < RESTApi.TOKEN_EXPIRATION_SAFE_TIME_MILLIS
+        return (token.expire_at_millis - current_time) < self.expiration_safe_time_millis
 
     def _get_global_token_lock(self, identifier_str: str) -> threading.Lock:
         with self._TOKEN_LOCKS_LOCK:
