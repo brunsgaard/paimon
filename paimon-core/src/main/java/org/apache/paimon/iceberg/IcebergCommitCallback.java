@@ -137,6 +137,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     private static final String SNAPSHOT_SUMMARY_TOTAL_EQUALITY_DELETES = "total-equality-deletes";
 
     private final FileStoreTable table;
+    private final boolean replay;
     private final String commitUser;
 
     private final IcebergPathFactory pathFactory;
@@ -155,8 +156,18 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     // -------------------------------------------------------------------------------------
 
     public IcebergCommitCallback(FileStoreTable table, String commitUser) {
+        this(table, commitUser, false);
+    }
+
+    /**
+     * @param replay true when one caller hands the snapshots over in order and is the only
+     *     committer, as {@link IcebergSync} does; such a caller publishes every snapshot that moves
+     *     the hint forward, not only the table's current head
+     */
+    public IcebergCommitCallback(FileStoreTable table, String commitUser, boolean replay) {
         this.table = table;
         this.commitUser = commitUser;
+        this.replay = replay;
 
         IcebergOptions.StorageType storageType =
                 table.coreOptions().toConfiguration().get(IcebergOptions.METADATA_ICEBERG_STORAGE);
@@ -346,10 +357,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             long abandonedNextRowId = 0;
             if (table.fileIO().exists(pathFactory.toMetadataPath(snapshotId))) {
                 if (metadataMatchesSnapshot(snapshotId, snapshot)) {
-                    // a retry repairs hint, pointer and files only while this snapshot is
-                    // still the head; a replay of an older committable must not move them back
-                    Long latestForRepair = table.snapshotManager().latestSnapshotId();
-                    if (latestForRepair == null || latestForRepair != snapshotId) {
+                    // a retry repairs hint, pointer and files only while this snapshot may be
+                    // published; a delayed older committable must not move them back
+                    if (!mayPublish(snapshotId)) {
                         return;
                     }
                     if (readVersionHint() != snapshotId) {
@@ -385,10 +395,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                                             RETIRE_PENDING_FILENAME));
                     return;
                 }
-                // a reused snapshot id: only the current head may replace the abandoned
-                // metadata; a delayed replay must not move hint or pointer backwards
-                Long latestNow = table.snapshotManager().latestSnapshotId();
-                if (latestNow == null || latestNow != snapshotId) {
+                // a reused snapshot id: only a publishable snapshot may replace the abandoned
+                // metadata; a delayed older committable must not move hint or pointer backwards
+                if (!mayPublish(snapshotId)) {
                     return;
                 }
                 // read the identity now, delete only at the write site: readers and the
@@ -666,9 +675,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                             + table.name());
         }
         // a delayed callback may still write its metadata (a newer commit extends it), but
-        // only the current head may move the hint and the external catalog
-        Long latestAtPublish = table.snapshotManager().latestSnapshotId();
-        if (latestAtPublish != null && latestAtPublish == snapshotId) {
+        // only a publishable snapshot may move the hint and the external catalog
+        if (mayPublish(snapshotId)) {
             table.fileIO()
                     .overwriteFileUtf8(
                             new Path(pathFactory.metadataDirectory(), VERSION_HINT_FILENAME),
@@ -828,6 +836,10 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
      * shared prefix makes reference counting non-trivial).
      */
     private void retireAbandonedSuffix() throws IOException {
+        Long latestNow = table.snapshotManager().latestSnapshotId();
+        if (latestNow == null) {
+            return;
+        }
         for (FileStatus status : table.fileIO().listStatus(pathFactory.metadataDirectory())) {
             String name = status.getPath().getName();
             if (!name.startsWith("v") || !name.endsWith(".metadata.json")) {
@@ -839,8 +851,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             } catch (NumberFormatException ignored) {
                 continue;
             }
-            Long latestNow = table.snapshotManager().latestSnapshotId();
-            if (latestNow == null || version <= latestNow) {
+            if (version <= latestNow) {
                 continue;
             }
             table.fileIO().deleteQuietly(status.getPath());
@@ -873,6 +884,21 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     }
 
     /** The version recorded in the hint file, or -1 when absent or unreadable. */
+    /**
+     * Whether this snapshot may move the version hint and the external catalog. A writer-side
+     * callback publishes only the table's current head, because delayed callbacks arrive out of
+     * order. A replay is the only committer and hands the snapshots over in order, so it also
+     * publishes whatever moves the hint forward while the writers are already ahead.
+     */
+    private boolean mayPublish(long snapshotId) {
+        if (replay && snapshotId >= readVersionHint()) {
+            return true;
+        }
+        // the head is always publishable; after a rollback the hint is ahead of the live table
+        Long latest = table.snapshotManager().latestSnapshotId();
+        return latest != null && latest == snapshotId;
+    }
+
     private long readVersionHint() {
         try {
             return Long.parseLong(
@@ -981,9 +1007,9 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         if (table.snapshotManager().snapshotExists(snapshotId - 1)
                 && !metadataMatchesSnapshot(
                         baseMetadata, table.snapshotManager().snapshot(snapshotId - 1))) {
-            Long latestNow = table.snapshotManager().latestSnapshotId();
-            if (latestNow == null || latestNow != snapshotId) {
-                // a delayed replay on the abandoned timeline: leave publication to the head
+            if (!mayPublish(snapshotId)) {
+                // a delayed older committable on the abandoned timeline: leave publication to
+                // a later one
                 return;
             }
             // keep the stale base's identity so external catalogs do not recreate the table
@@ -1208,8 +1234,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         if (table.snapshotManager().snapshotExists(baseSnapshotId)
                 && !metadataMatchesSnapshot(
                         baseMetadata, table.snapshotManager().snapshot(baseSnapshotId))) {
-            Long latestNow = table.snapshotManager().latestSnapshotId();
-            if (latestNow == null || latestNow != snapshotId) {
+            if (!mayPublish(snapshotId)) {
                 return;
             }
             createMetadataWithoutBase(
@@ -1513,9 +1538,8 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                             + table.name());
         }
         // a delayed callback may still write its metadata (a newer commit extends it), but
-        // only the current head may move the hint and the external catalog
-        Long latestAtPublish = table.snapshotManager().latestSnapshotId();
-        if (latestAtPublish != null && latestAtPublish == snapshotId) {
+        // only a publishable snapshot may move the hint and the external catalog
+        if (mayPublish(snapshotId)) {
             table.fileIO()
                     .overwriteFileUtf8(
                             new Path(pathFactory.metadataDirectory(), VERSION_HINT_FILENAME),

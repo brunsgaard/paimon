@@ -127,6 +127,25 @@ public class IcebergSyncTest {
     }
 
     @Test
+    public void testASnapshotBehindTheWritersHeadIsPublished() throws Exception {
+        write(stockTable, 1, GenericRow.of(1, 10));
+        try (IcebergSync sync = new IcebergSync(mirrorTable)) {
+            sync.syncPending();
+            write(stockTable, 2, GenericRow.of(2, 20));
+            write(stockTable, 3, GenericRow.of(3, 30));
+
+            // the writer is at 3 while the sync publishes 2: the hint and the readers follow
+            assertThat(sync.sync(2)).isTrue();
+            assertThat(IcebergSync.lastMirroredSnapshot(mirrorTable)).isEqualTo(2L);
+            assertThat(getIcebergResult())
+                    .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+            assertThat(sync.sync(3)).isTrue();
+            assertThat(IcebergSync.lastMirroredSnapshot(mirrorTable)).isEqualTo(3L);
+        }
+    }
+
+    @Test
     public void testSyncIsIdempotent() throws Exception {
         write(stockTable, 1, GenericRow.of(1, 10));
         write(stockTable, 2, GenericRow.of(2, 20));

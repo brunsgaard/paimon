@@ -68,7 +68,7 @@ public final class IcebergSync implements AutoCloseable {
                 "%s must be set on the table copy given to IcebergSync.",
                 IcebergOptions.METADATA_ICEBERG_STORAGE.key());
         this.table = table;
-        this.callback = new IcebergCommitCallback(table, "iceberg-sync");
+        this.callback = new IcebergCommitCallback(table, "iceberg-sync", true);
         this.indexFileHandler = table.store().newIndexFileHandler();
     }
 
