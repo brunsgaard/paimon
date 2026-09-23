@@ -253,7 +253,12 @@ public class RESTTokenFileIO implements FileIO {
 
     private boolean shouldRefresh() {
         return token == null
-                || token.expireAtMillis() - System.currentTimeMillis() < expirationSafeTimeMillis;
+                || token.expireAtMillis() - currentTimeMillis() < expirationSafeTimeMillis;
+    }
+
+    @VisibleForTesting
+    long currentTimeMillis() {
+        return System.currentTimeMillis();
     }
 
     @VisibleForTesting

@@ -52,6 +52,8 @@ import static org.mockito.Mockito.when;
 /** Tests for {@link RESTTokenFileIO}. */
 class RESTTokenFileIOTest {
 
+    private static final long FIXED_NOW = 1700000000000L;
+
     @Test
     void testSetFileIOCacheMaximumSize() {
         long originalMaximumSize = RESTTokenFileIO.fileIOCacheMaximumSize();
@@ -230,9 +232,22 @@ class RESTTokenFileIOTest {
                 .thenAnswer(
                         invocation ->
                                 new GetTableTokenResponse(
-                                        Collections.emptyMap(),
-                                        System.currentTimeMillis() + remainingMillis));
+                                        Collections.emptyMap(), FIXED_NOW + remainingMillis));
         return api;
+    }
+
+    private static RESTTokenFileIO fileIOAtFixedTime(
+            Options options, RESTApi api, Identifier identifier) throws IOException {
+        return new RESTTokenFileIO(
+                CatalogContext.create(options, ossLoader(), null),
+                api,
+                identifier,
+                new Path("oss://bucket/table")) {
+            @Override
+            long currentTimeMillis() {
+                return FIXED_NOW;
+            }
+        };
     }
 
     @Test
@@ -240,12 +255,7 @@ class RESTTokenFileIOTest {
             throws IOException {
         Identifier identifier = Identifier.create("db", "table");
         RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(30).toMillis());
-        RESTTokenFileIO fileIO =
-                new RESTTokenFileIO(
-                        CatalogContext.create(new Options(), ossLoader(), null),
-                        api,
-                        identifier,
-                        new Path("oss://bucket/table"));
+        RESTTokenFileIO fileIO = fileIOAtFixedTime(new Options(), api, identifier);
 
         fileIO.exists(new Path("oss://bucket/table/a"));
         fileIO.exists(new Path("oss://bucket/table/b"));
@@ -259,12 +269,7 @@ class RESTTokenFileIOTest {
             throws IOException {
         Identifier identifier = Identifier.create("db", "table");
         RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(2).toMillis());
-        RESTTokenFileIO fileIO =
-                new RESTTokenFileIO(
-                        CatalogContext.create(new Options(), ossLoader(), null),
-                        api,
-                        identifier,
-                        new Path("oss://bucket/table"));
+        RESTTokenFileIO fileIO = fileIOAtFixedTime(new Options(), api, identifier);
 
         fileIO.exists(new Path("oss://bucket/table/a"));
         fileIO.exists(new Path("oss://bucket/table/b"));
@@ -278,12 +283,7 @@ class RESTTokenFileIOTest {
         RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(30).toMillis());
         Options options = new Options();
         options.set(RESTCatalogOptions.DATA_TOKEN_EXPIRATION_SAFE_TIME, Duration.ofHours(1));
-        RESTTokenFileIO fileIO =
-                new RESTTokenFileIO(
-                        CatalogContext.create(options, ossLoader(), null),
-                        api,
-                        identifier,
-                        new Path("oss://bucket/table"));
+        RESTTokenFileIO fileIO = fileIOAtFixedTime(options, api, identifier);
 
         fileIO.exists(new Path("oss://bucket/table/a"));
         fileIO.exists(new Path("oss://bucket/table/b"));
@@ -297,12 +297,7 @@ class RESTTokenFileIOTest {
         RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(2).toMillis());
         Options options = new Options();
         options.set(RESTCatalogOptions.DATA_TOKEN_EXPIRATION_SAFE_TIME, Duration.ofMinutes(1));
-        RESTTokenFileIO fileIO =
-                new RESTTokenFileIO(
-                        CatalogContext.create(options, ossLoader(), null),
-                        api,
-                        identifier,
-                        new Path("oss://bucket/table"));
+        RESTTokenFileIO fileIO = fileIOAtFixedTime(options, api, identifier);
 
         fileIO.exists(new Path("oss://bucket/table/a"));
         fileIO.exists(new Path("oss://bucket/table/b"));
