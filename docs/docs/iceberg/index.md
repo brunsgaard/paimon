@@ -61,6 +61,54 @@ Metadata publication does not copy the table's data. Iceberg readers therefore n
 the metadata location and the original Paimon data files, including the required filesystem
 configuration and credentials.
 
+## Mirror from a Separate Job
+
+By default every job that commits to a table also publishes the Iceberg metadata. To keep writers
+free of the mirror, leave the `metadata.iceberg.*` options off the table and run the `iceberg_sync`
+action instead. It mirrors every snapshot since the last mirrored one, in order, so the Iceberg
+history follows the Paimon history.
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    iceberg_sync \
+    --warehouse <warehouse-path> \
+    --including_databases <database-name|name-regular-expr> \
+    [--including_tables <database.table|name-regular-expr>] \
+    [--excluding_tables <database.table|name-regular-expr>] \
+    [--database <database-name> --table <table-name>] \
+    [--poll_interval <duration>] \
+    --table_conf metadata.iceberg.storage=<storage> \
+    [--table_conf <key>=<value> ...] \
+    [--catalog_conf <key>=<value> ...]
+```
+
+In batch mode the action syncs every matching table to its latest snapshot and exits. In streaming
+mode it rediscovers the tables and polls for new snapshots every `--poll_interval`, 10 seconds by
+default. The table patterns match the full `database.table` name, as they do for `compact_database`.
+
+The mirror options come only from `--table_conf` and apply to a table copy inside the job. A table
+that sets `metadata.iceberg.storage` itself is refused, because its writers already publish the
+mirror. A table with `deletion-vectors.enabled` and `deletion-vectors.bitmap64` is mirrored as
+Iceberg format version 3 unless `--table_conf` sets `metadata.iceberg.format-version`; an explicit
+version 2 is refused, because it would drop the deletion vectors from the mirror.
+
+The first sync of a table mirrors its latest snapshot. When snapshots expired before they were
+mirrored, the action logs a warning and mirrors the latest snapshot from a scan of the table.
+
+The same for one table from Flink SQL:
+
+```sql
+CALL sys.iceberg_sync(
+    `table` => 'db.t',
+    `options` => 'metadata.iceberg.storage=rest-catalog,metadata.iceberg.uri=http://localhost:8181');
+```
+
+The procedure returns the number of snapshots it mirrored. Arguments:
+
+- `table` (required): the target table identifier.
+- `options` (required): the `metadata.iceberg.*` options for the mirror, comma separated.
+
 ## What Iceberg Readers See
 
 | Paimon table | Files eligible for incremental publication | When changes become visible |

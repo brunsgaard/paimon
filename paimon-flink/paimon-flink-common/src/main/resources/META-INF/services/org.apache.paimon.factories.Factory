@@ -18,6 +18,7 @@ org.apache.paimon.flink.action.CopyFilesActionFactory
 org.apache.paimon.flink.action.CompactActionFactory
 org.apache.paimon.flink.action.CompactManifestActionFactory
 org.apache.paimon.flink.action.CompactDatabaseActionFactory
+org.apache.paimon.flink.action.IcebergSyncActionFactory
 org.apache.paimon.flink.action.DropPartitionActionFactory
 org.apache.paimon.flink.action.DeleteActionFactory
 org.apache.paimon.flink.action.MergeIntoActionFactory
@@ -80,6 +81,7 @@ org.apache.paimon.flink.procedure.MigrateDatabaseProcedure
 org.apache.paimon.flink.procedure.RemoveOrphanFilesProcedure
 org.apache.paimon.flink.procedure.QueryServiceProcedure
 org.apache.paimon.flink.procedure.ExpireSnapshotsProcedure
+org.apache.paimon.flink.procedure.IcebergSyncProcedure
 org.apache.paimon.flink.procedure.ExpireChangelogsProcedure
 org.apache.paimon.flink.procedure.ExpirePartitionsProcedure
 org.apache.paimon.flink.procedure.PurgeFilesProcedure
