@@ -459,19 +459,39 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 if (probeRegisterTable(registerPath)) {
                     // the table disappeared concurrently and the probe registered it
                     verifyRegistered(newMetadata);
+                    commitPropertiesIfChanged();
                     return;
                 }
+                captureForeignProperties();
                 dropTable();
             }
             icebergTable =
                     restCatalog.registerTable(icebergTableIdentifier, registerPath.toString());
             verifyRegistered(newMetadata);
+            commitPropertiesIfChanged();
         } catch (UnsupportedOperationException e) {
             throw e;
         } catch (Exception e) {
             throw new RuntimeException(
                     "Fail to register iceberg table " + icebergTableIdentifier, e);
         }
+    }
+
+    /**
+     * Applies the committer's properties to a registered table when they differ from it. A
+     * registration imports the metadata file as it is, so write.data.path, the metadata retention
+     * settings, the custom properties and the properties carried across a drop are set here.
+     */
+    private void commitPropertiesIfChanged() {
+        TableMetadata current = ((BaseTable) icebergTable).operations().current();
+        TableMetadata.Builder update = TableMetadata.buildFrom(current);
+        updateProperties(update);
+        TableMetadata updated = update.build();
+        if (updated.changes().isEmpty()) {
+            return;
+        }
+        ((BaseTable) icebergTable).operations().commit(current, updated);
+        icebergTable = getTable();
     }
 
     /**

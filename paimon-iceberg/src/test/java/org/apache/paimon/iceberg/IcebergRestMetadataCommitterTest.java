@@ -1523,6 +1523,85 @@ public class IcebergRestMetadataCommitterTest {
         assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
     }
 
+    @Test
+    public void testRegistrationKeepsForeignPropertiesAndSetsWriteDataPath() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "comment", "kept");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(true, 2));
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        icebergTable.updateProperties().set("sync.pointer", "p.d.t").commit();
+
+        // a foreign snapshot makes the base incorrect; the v3 lineage watermark forces the
+        // registration path instead of a create
+        icebergTable.newAppend().commit();
+        write.write(GenericRow.of(3, 30));
+        commit.commit(3, write.prepareCommit(true, 3));
+        write.close();
+        commit.close();
+
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties())
+                .containsEntry("sync.pointer", "p.d.t")
+                .containsEntry("comment", "kept")
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)", "Record(3, 30)");
+    }
+
+    @Test
+    public void testRegistrationAppliesThePropertiesInOneCommit() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(true, 2));
+        restCatalog.dropTable(TableIdentifier.of("mydb", "t"), false);
+        write.write(GenericRow.of(3, 30));
+        commit.commit(3, write.prepareCommit(true, 3));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        TableMetadata current = ((BaseTable) icebergTable).operations().current();
+        // registration imported the metadata file as is; one property commit followed
+        assertThat(current.previousFiles()).hasSize(1);
+        assertThat(icebergTable.properties())
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
+    }
+
     private FileStoreTable tableWithComment(String comment) throws Exception {
         RowType rowType =
                 RowType.of(
