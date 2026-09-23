@@ -116,7 +116,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     private static final Logger LOG = LoggerFactory.getLogger(IcebergCommitCallback.class);
 
     // see org.apache.iceberg.hadoop.Util
-    private static final String VERSION_HINT_FILENAME = "version-hint.text";
+    static final String VERSION_HINT_FILENAME = "version-hint.text";
 
     private static final String PUFFIN_FORMAT = "puffin";
 
@@ -2177,7 +2177,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
      */
     static final String SNAPSHOT_SUMMARY_PAIMON_COMMIT_IDENTITY = "paimon-commit-identity";
 
-    private static String commitIdentity(Snapshot snapshot) {
+    static String commitIdentity(Snapshot snapshot) {
         // snapshot uuid when present; legacy snapshots fall back to user/identifier/time
         if (snapshot.uuid() != null) {
             return snapshot.uuid();
