@@ -1712,6 +1712,83 @@ public class IcebergRestMetadataCommitterTest {
         assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
     }
 
+    @Test
+    public void testLostMetadataDirectoryOnAFormatVersion3TableStillCommits() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(true, 2));
+        // the catalog's next-row-id is now above zero
+
+        // every Iceberg metadata file on the Paimon side is lost: the rebuilt snapshot starts its
+        // row lineage at zero, which Iceberg refuses as an update to the existing table
+        table.fileIO().delete(catalogTableMetadataPath(table), true);
+        write.write(GenericRow.of(3, 30));
+        commit.commit(3, write.prepareCommit(true, 3));
+        write.close();
+        commit.close();
+
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)", "Record(3, 30)");
+    }
+
+    @Test
+    public void testAnIdempotentRetryRepairsTheTableProperties() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.close();
+        commit.close();
+
+        // a property commit that failed after the snapshot commit leaves the table like this
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        icebergTable.updateProperties().remove(TableProperties.WRITE_DATA_LOCATION).commit();
+
+        long latest = table.snapshotManager().latestSnapshotId();
+        Path metadataDir = catalogTableMetadataPath(table);
+        try (IcebergRestMetadataCommitter committer = new IcebergRestMetadataCommitter(table)) {
+            committer.commitMetadata(
+                    IcebergMetadata.fromPath(
+                            table.fileIO(), new Path(metadataDir, "v" + latest + ".metadata.json")),
+                    IcebergMetadata.fromPath(
+                            table.fileIO(),
+                            new Path(metadataDir, "v" + (latest - 1) + ".metadata.json")));
+        }
+
+        assertThat(restCatalog.loadTable(TableIdentifier.of("mydb", "t")).properties())
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
+    }
+
     private FileStoreTable tableWithComment(String comment) throws Exception {
         RowType rowType =
                 RowType.of(

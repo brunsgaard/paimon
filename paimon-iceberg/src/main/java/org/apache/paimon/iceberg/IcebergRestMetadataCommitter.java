@@ -107,6 +107,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     /** Properties of the previous Iceberg table to set again after a recreate. */
     @Nullable private Map<String, String> propertiesToRestore;
 
+    @Nullable private Set<String> historicalCustomKeys;
+
     public IcebergRestMetadataCommitter(FileStoreTable table) {
         Options options = new Options(table.options());
         icebergOptions = new IcebergOptions(options);
@@ -264,6 +266,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                             "Iceberg table {} is already at snapshot {}, nothing to commit.",
                             icebergTableIdentifier,
                             newCurrent.snapshotId());
+                    // a property commit that failed after the snapshot commit is repaired here
+                    commitPropertiesIfChanged();
                     return;
                 }
 
@@ -300,8 +304,18 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                                 baseIcebergMetadata == null
                                         ? "none"
                                         : baseIcebergMetadata.currentSnapshotId());
-                        updateBuilder = updatesForCorrectBase(metadata, newMetadata, false);
-                        reconciled = true;
+                        try {
+                            updateBuilder = updatesForCorrectBase(metadata, newMetadata, false);
+                            reconciled = true;
+                        } catch (ValidationException e) {
+                            // Iceberg refused the update while it was built; recreate as before
+                            LOG.warn(
+                                    "Reconciling Iceberg table {} in place is not possible,"
+                                            + " recreating it.",
+                                    icebergTableIdentifier,
+                                    e);
+                            updateBuilder = updatesForIncorrectBase(newMetadata);
+                        }
                     } else {
                         LOG.info(
                                 "create updates without base metadata. currentSnapshotId for base metadata: {}, for new metadata:{}",
@@ -384,6 +398,13 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
             return false;
         }
         if (catalog.snapshot(newCurrent.snapshotId()) != null) {
+            return false;
+        }
+        // row lineage: a rebuilt snapshot may start its row ids below the catalog's watermark
+        if (newMetadata.formatVersion() >= 3
+                && catalog.nextRowId() > 0
+                && newCurrent.firstRowId() != null
+                && newCurrent.firstRowId() < catalog.nextRowId()) {
             return false;
         }
         for (Snapshot snapshot : newMetadata.snapshots()) {
@@ -823,17 +844,24 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         return foreign;
     }
 
-    /** Every custom property key the Paimon table's schema history ever set. */
+    /**
+     * Every custom property key the Paimon table's schema history ever set. Read once per
+     * committer: a schema change rebuilds the callback and with it this committer.
+     */
     private Set<String> historicalCustomKeys() {
-        Set<String> customKeys = new HashSet<>(customTableProperties().keySet());
-        for (TableSchema schema : schemaManager.listAll()) {
-            for (String key : schema.options().keySet()) {
-                if (key.startsWith(IcebergOptions.TABLE_PROPERTIES_PREFIX)) {
-                    customKeys.add(key.substring(IcebergOptions.TABLE_PROPERTIES_PREFIX.length()));
+        if (historicalCustomKeys == null) {
+            Set<String> customKeys = new HashSet<>(customTableProperties().keySet());
+            for (TableSchema schema : schemaManager.listAll()) {
+                for (String key : schema.options().keySet()) {
+                    if (key.startsWith(IcebergOptions.TABLE_PROPERTIES_PREFIX)) {
+                        customKeys.add(
+                                key.substring(IcebergOptions.TABLE_PROPERTIES_PREFIX.length()));
+                    }
                 }
             }
+            historicalCustomKeys = customKeys;
         }
-        return customKeys;
+        return historicalCustomKeys;
     }
 
     /** Remembers the foreign properties of the catalog entry that is about to be dropped. */
