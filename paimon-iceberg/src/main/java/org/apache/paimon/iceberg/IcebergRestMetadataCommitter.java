@@ -795,6 +795,11 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     }
 
     /** Properties set by others than this committer, kept across a recreate. */
+    @Override
+    public void close() throws IOException {
+        restCatalog.close();
+    }
+
     /** Properties this committer writes itself and derives again after a recreate. */
     private static boolean isOwnedProperty(String key) {
         return key.startsWith("write.metadata.") || key.equals(TableProperties.WRITE_DATA_LOCATION);

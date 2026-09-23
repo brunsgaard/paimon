@@ -279,7 +279,11 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
     }
 
     @Override
-    public void close() throws Exception {}
+    public void close() throws Exception {
+        if (metadataCommitter != null) {
+            metadataCommitter.close();
+        }
+    }
 
     @Override
     public void call(Context context) {

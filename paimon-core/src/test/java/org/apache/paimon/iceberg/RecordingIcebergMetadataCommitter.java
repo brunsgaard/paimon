@@ -34,6 +34,7 @@ public class RecordingIcebergMetadataCommitter implements IcebergMetadataCommitt
     public static final List<Object> COMMITS = Collections.synchronizedList(new ArrayList<>());
     public static final List<Object> BASES = Collections.synchronizedList(new ArrayList<>());
     public static volatile boolean failNextCommit = false;
+    public static volatile int closed = 0;
 
     private static void maybeFail() {
         if (failNextCommit) {
@@ -60,6 +61,11 @@ public class RecordingIcebergMetadataCommitter implements IcebergMetadataCommitt
         maybeFail();
         COMMITS.add(newIcebergMetadata);
         BASES.add(baseIcebergMetadata);
+    }
+
+    @Override
+    public void close() {
+        closed++;
     }
 
     /** Registered under hadoop-catalog: no real committer exists there, so no ambiguity. */

@@ -146,6 +146,18 @@ public class IcebergSyncTest {
     }
 
     @Test
+    public void testCloseClosesTheMetadataCommitter() throws Exception {
+        write(stockTable, 1, GenericRow.of(1, 10));
+        Map<String, String> options = new HashMap<>(mirrorOptions());
+        options.put("metadata.iceberg.storage", "hadoop-catalog");
+        RecordingIcebergMetadataCommitter.closed = 0;
+        try (IcebergSync sync = new IcebergSync(stockTable.copy(options))) {
+            assertThat(sync.syncPending()).isEqualTo(1);
+        }
+        assertThat(RecordingIcebergMetadataCommitter.closed).isEqualTo(1);
+    }
+
+    @Test
     public void testSyncIsIdempotent() throws Exception {
         write(stockTable, 1, GenericRow.of(1, 10));
         write(stockTable, 2, GenericRow.of(2, 20));
