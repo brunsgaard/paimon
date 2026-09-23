@@ -51,6 +51,7 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -1332,6 +1333,64 @@ public class IcebergRestMetadataCommitterTest {
 
         write.close();
         commit.close();
+    }
+
+    @Test
+    public void testForeignPropertiesSurviveRecreate() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties())
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
+        java.util.UUID uuidBefore = icebergTable.uuid();
+        // a property another tool set on the mirror
+        icebergTable.updateProperties().set("sync.pointer", "p.d.t").commit();
+
+        // Lose every Iceberg metadata file on the Paimon side, so the next commit has no base and
+        // the REST committer recreates the table.
+        table.fileIO().delete(catalogTableMetadataPath(table), true);
+        write.write(GenericRow.of(2, 20));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.uuid()).isNotEqualTo(uuidBefore);
+        assertThat(icebergTable.properties())
+                .containsEntry("sync.pointer", "p.d.t")
+                .containsEntry(TableProperties.WRITE_DATA_LOCATION, table.location().toString());
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testForeignPropertiesFilter() {
+        Map<String, String> properties = new HashMap<>();
+        properties.put("write.metadata.previous-versions-max", "5");
+        properties.put("write.metadata.delete-after-commit.enabled", "true");
+        properties.put(TableProperties.WRITE_DATA_LOCATION, "file:/old");
+        properties.put("write.parquet.compression-codec", "zstd");
+        properties.put("sync.pointer", "p.d.t");
+        properties.put("owner", "someone");
+        assertThat(IcebergRestMetadataCommitter.foreignProperties(properties))
+                .containsOnlyKeys("write.parquet.compression-codec", "sync.pointer", "owner");
     }
 
     @Test

@@ -93,8 +93,12 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     private final IcebergOptions icebergOptions;
     private final int unknownHostMaxRetries;
     private final long unknownHostInitialRetryDelayMillis;
+    /** The Paimon table location: the manifests and data files the mirror points at live here. */
+    private final String tableLocation;
 
     private Table icebergTable;
+    /** Properties of the previous Iceberg table to set again after a recreate. */
+    @Nullable private Map<String, String> propertiesToRestore;
 
     public IcebergRestMetadataCommitter(FileStoreTable table) {
         Options options = new Options(table.options());
@@ -112,6 +116,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 IcebergOptions.UNKNOWN_HOST_RETRY_INITIAL_DELAY_MILLIS.key());
         this.fileIO = table.fileIO();
         this.metadataDirectory = IcebergCommitCallback.catalogTableMetadataPath(table);
+        tableLocation = table.location().toString();
 
         Identifier identifier = Preconditions.checkNotNull(table.catalogEnvironment().identifier());
         String icebergDatabase = options.get(IcebergOptions.METASTORE_DATABASE);
@@ -667,6 +672,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
     private Table recreateTable(TableMetadata newMetadata) {
         try {
+            propertiesToRestore = foreignProperties(icebergTable.properties());
             dropTable();
             return createTable(newMetadata);
         } catch (Exception e) {
@@ -682,6 +688,19 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     private void dropTable() {
         // set purge to false, because we don't need to delete the data files
         restCatalog.dropTable(icebergTableIdentifier, false);
+    }
+
+    /** Properties set by others than this committer, kept across a recreate. */
+    static Map<String, String> foreignProperties(Map<String, String> properties) {
+        Map<String, String> foreign = new HashMap<>();
+        properties.forEach(
+                (key, value) -> {
+                    if (!key.startsWith("write.metadata.")
+                            && !key.equals(TableProperties.WRITE_DATA_LOCATION)) {
+                        foreign.put(key, value);
+                    }
+                });
+        return foreign;
     }
 
     // -------------------------------------------------------------------------------------
@@ -721,10 +740,14 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         String desiredDeleteAfter = String.valueOf(icebergOptions.deleteAfterCommitEnabled());
 
         Map<String, String> current = icebergTable.properties();
+        // write.data.path: the data and manifests are Paimon's, outside the Iceberg table
+        // location. A catalog that vends credentials scopes them from this property.
         boolean changed =
                 !desiredMax.equals(current.get(METADATA_PREVIOUS_VERSIONS_MAX))
                         || !desiredDeleteAfter.equals(
-                                current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED));
+                                current.get(METADATA_DELETE_AFTER_COMMIT_ENABLED))
+                        || !tableLocation.equals(current.get(TableProperties.WRITE_DATA_LOCATION))
+                        || propertiesToRestore != null;
 
         Map<String, String> customProperties = customTableProperties();
         for (Map.Entry<String, String> entry : customProperties.entrySet()) {
@@ -736,9 +759,14 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
         if (changed) {
             Map<String, String> properties = new HashMap<>();
+            if (propertiesToRestore != null) {
+                properties.putAll(propertiesToRestore);
+                propertiesToRestore = null;
+            }
             properties.put(METADATA_PREVIOUS_VERSIONS_MAX, desiredMax);
             properties.put(METADATA_DELETE_AFTER_COMMIT_ENABLED, desiredDeleteAfter);
             properties.putAll(customProperties);
+            properties.put(TableProperties.WRITE_DATA_LOCATION, tableLocation);
             update.setProperties(properties);
         }
     }
