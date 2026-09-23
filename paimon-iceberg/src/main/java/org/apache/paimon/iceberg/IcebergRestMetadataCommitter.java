@@ -48,6 +48,8 @@ import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.rest.Endpoint;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.types.Types;
@@ -222,6 +224,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
 
         // updates to be committed
         TableMetadata.Builder updateBuilder;
+        boolean reconciled = false;
 
         // create database if not exist
         if (!databaseExists()) {
@@ -287,6 +290,18 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                     if (withBase) {
                         LOG.info("create updates with base metadata.");
                         updateBuilder = updatesForCorrectBase(metadata, newMetadata, false);
+                    } else if (!requiresRegistration(newIcebergMetadata)
+                            && canReconcile(metadata, newMetadata)) {
+                        LOG.info(
+                                "Iceberg table {} is at snapshot {} instead of base {};"
+                                        + " reconciling in place.",
+                                icebergTableIdentifier,
+                                metadata.currentSnapshot().snapshotId(),
+                                baseIcebergMetadata == null
+                                        ? "none"
+                                        : baseIcebergMetadata.currentSnapshotId());
+                        updateBuilder = updatesForCorrectBase(metadata, newMetadata, false);
+                        reconciled = true;
                     } else {
                         LOG.info(
                                 "create updates without base metadata. currentSnapshotId for base metadata: {}, for new metadata:{}",
@@ -320,11 +335,74 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
             ((BaseTable) icebergTable)
                     .operations()
                     .commit(((BaseTable) icebergTable).operations().current(), updatedForCommit);
+        } catch (CommitFailedException | ValidationException e) {
+            if (!reconciled) {
+                throw new RuntimeException(
+                        "Fail to commit metadata to rest catalog for table: "
+                                + icebergTableIdentifier,
+                        e);
+            }
+            // the server refused the reconciled update; recreate as before
+            LOG.warn(
+                    "Reconciling Iceberg table {} in place was refused, recreating it.",
+                    icebergTableIdentifier,
+                    e);
+            TableMetadata recreated = updatesForIncorrectBase(newMetadata).build();
+            try {
+                ((BaseTable) icebergTable)
+                        .operations()
+                        .commit(((BaseTable) icebergTable).operations().current(), recreated);
+            } catch (Exception retry) {
+                throw new RuntimeException(
+                        "Fail to commit metadata to rest catalog for table: "
+                                + icebergTableIdentifier,
+                        retry);
+            }
         } catch (Exception e) {
             throw new RuntimeException(
                     "Fail to commit metadata to rest catalog for table: " + icebergTableIdentifier,
                     e);
         }
+    }
+
+    /**
+     * Whether the catalog table can be moved to {@code newMetadata} with updates instead of a
+     * recreate. The new metadata must continue the catalog's lineage: every snapshot id both sides
+     * know must be the same Paimon commit, otherwise the catalog would keep a snapshot of an
+     * abandoned timeline under a live id. The table uuid is no lineage check: the catalog assigns
+     * its own at create. Iceberg requires sequence numbers to increase, refuses a snapshot id it
+     * already has and a format downgrade, and keeps one schema per id, so those are the other
+     * conditions.
+     */
+    static boolean canReconcile(TableMetadata catalog, TableMetadata newMetadata) {
+        Snapshot newCurrent = newMetadata.currentSnapshot();
+        if (newCurrent == null || newMetadata.formatVersion() < catalog.formatVersion()) {
+            return false;
+        }
+        if (catalog.formatVersion() > 1
+                && newCurrent.sequenceNumber() <= catalog.lastSequenceNumber()) {
+            return false;
+        }
+        if (catalog.snapshot(newCurrent.snapshotId()) != null) {
+            return false;
+        }
+        for (Snapshot snapshot : newMetadata.snapshots()) {
+            Snapshot known = catalog.snapshot(snapshot.snapshotId());
+            if (known != null
+                    && !java.util.Objects.equals(
+                            known.summary().get(PAIMON_COMMIT_IDENTITY),
+                            snapshot.summary().get(PAIMON_COMMIT_IDENTITY))) {
+                return false;
+            }
+        }
+        for (Schema schema : newMetadata.schemas()) {
+            Schema existing = catalog.schemasById().get(schema.schemaId());
+            if (existing != null && !existing.sameSchema(schema)) {
+                return false;
+            }
+        }
+        return newMetadata.currentSchemaId() > catalog.currentSchemaId()
+                || catalog.schemasById().containsKey(newMetadata.currentSchemaId());
     }
 
     private TableMetadata.Builder updatesForCorrectBase(
