@@ -18,6 +18,7 @@
 
 package org.apache.paimon.rest;
 
+import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BlobDescriptor;
@@ -51,9 +52,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.paimon.options.CatalogOptions.FILE_IO_ALLOW_CACHE;
-import static org.apache.paimon.rest.RESTApi.TOKEN_EXPIRATION_SAFE_TIME_MILLIS;
 import static org.apache.paimon.rest.RESTCatalogOptions.DLF_OSS_ENDPOINT;
 import static org.apache.paimon.rest.RESTCatalogOptions.IO_CACHE_ENABLED;
+import static org.apache.paimon.rest.RESTCatalogOptions.TOKEN_EXPIRATION_SAFE_TIME;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /** A {@link FileIO} to support getting token from REST Server. */
@@ -112,12 +113,16 @@ public class RESTTokenFileIO implements FileIO {
     // Server again after serialization
     private volatile RESTToken token;
 
+    private final long expirationSafeTimeMillis;
+
     public RESTTokenFileIO(
             CatalogContext catalogContext, RESTApi apiInstance, Identifier identifier, Path path) {
         this.catalogContext = catalogContext;
         this.apiInstance = apiInstance;
         this.identifier = identifier;
         this.path = path;
+        this.expirationSafeTimeMillis =
+                catalogContext.options().get(TOKEN_EXPIRATION_SAFE_TIME).toMillis();
     }
 
     @Override
@@ -244,8 +249,12 @@ public class RESTTokenFileIO implements FileIO {
 
     private boolean shouldRefresh() {
         return token == null
-                || token.expireAtMillis() - System.currentTimeMillis()
-                        < TOKEN_EXPIRATION_SAFE_TIME_MILLIS;
+                || token.expireAtMillis() - System.currentTimeMillis() < expirationSafeTimeMillis;
+    }
+
+    @VisibleForTesting
+    long expirationSafeTimeMillis() {
+        return expirationSafeTimeMillis;
     }
 
     private void refreshToken() {

@@ -31,7 +31,11 @@ import org.apache.paimon.rest.responses.GetTableTokenResponse;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.UUID;
@@ -41,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -207,5 +212,110 @@ class RESTTokenFileIOTest {
         verify(delegate).listFilesIterative(tableRoot, false);
         // the interface default would construct its own iterator backed by listStatus
         verify(delegate, never()).listStatus(any());
+    }
+
+    private static FileIOLoader ossLoader() throws IOException {
+        FileIO delegate = mock(FileIO.class);
+        when(delegate.exists(any())).thenReturn(true);
+        FileIOLoader loader = mock(FileIOLoader.class);
+        when(loader.load(any())).thenReturn(delegate);
+        when(loader.getScheme()).thenReturn("oss");
+        return loader;
+    }
+
+    private static RESTApi apiVendingTokenWithRemaining(
+            Identifier identifier, long remainingMillis) {
+        RESTApi api = mock(RESTApi.class);
+        when(api.loadTableToken(identifier))
+                .thenAnswer(
+                        invocation ->
+                                new GetTableTokenResponse(
+                                        Collections.emptyMap(),
+                                        System.currentTimeMillis() + remainingMillis));
+        return api;
+    }
+
+    @Test
+    void testDefaultWindowRefreshesATokenWithLessThanAnHourLeftOnEveryAccess() throws IOException {
+        Identifier identifier = Identifier.create("db", "table");
+        RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(30).toMillis());
+        RESTTokenFileIO fileIO =
+                new RESTTokenFileIO(
+                        CatalogContext.create(new Options(), ossLoader(), null),
+                        api,
+                        identifier,
+                        new Path("oss://bucket/table"));
+
+        fileIO.exists(new Path("oss://bucket/table/a"));
+        fileIO.exists(new Path("oss://bucket/table/b"));
+
+        // Unchanged behaviour: 30 minutes is under the one-hour default, so every access refreshes.
+        verify(api, times(2)).loadTableToken(identifier);
+    }
+
+    @Test
+    void testConfiguredWindowRefreshesOnceWhileTheTokenHasMoreThanTheWindowLeft()
+            throws IOException {
+        Identifier identifier = Identifier.create("db", "table");
+        RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(30).toMillis());
+        Options options = new Options();
+        options.set(RESTCatalogOptions.TOKEN_EXPIRATION_SAFE_TIME, Duration.ofMinutes(5));
+        RESTTokenFileIO fileIO =
+                new RESTTokenFileIO(
+                        CatalogContext.create(options, ossLoader(), null),
+                        api,
+                        identifier,
+                        new Path("oss://bucket/table"));
+
+        fileIO.exists(new Path("oss://bucket/table/a"));
+        fileIO.exists(new Path("oss://bucket/table/b"));
+        fileIO.exists(new Path("oss://bucket/table/c"));
+
+        verify(api, times(1)).loadTableToken(identifier);
+    }
+
+    @Test
+    void testTokenBelowWindowRefreshesOncePerAccess() throws IOException {
+        Identifier identifier = Identifier.create("db", "table");
+        RESTApi api = apiVendingTokenWithRemaining(identifier, Duration.ofMinutes(2).toMillis());
+        Options options = new Options();
+        options.set(RESTCatalogOptions.TOKEN_EXPIRATION_SAFE_TIME, Duration.ofMinutes(5));
+        RESTTokenFileIO fileIO =
+                new RESTTokenFileIO(
+                        CatalogContext.create(options, ossLoader(), null),
+                        api,
+                        identifier,
+                        new Path("oss://bucket/table"));
+
+        fileIO.exists(new Path("oss://bucket/table/a"));
+        fileIO.exists(new Path("oss://bucket/table/b"));
+
+        // A token that never reaches the window is refreshed on each access, once per access.
+        verify(api, times(2)).loadTableToken(identifier);
+    }
+
+    @Test
+    void testRefreshWindowSurvivesSerialization() throws IOException, ClassNotFoundException {
+        Identifier identifier = Identifier.create("db", "table");
+        Options options = new Options();
+        options.set(RESTCatalogOptions.TOKEN_EXPIRATION_SAFE_TIME, Duration.ofMinutes(5));
+        RESTTokenFileIO fileIO =
+                new RESTTokenFileIO(
+                        CatalogContext.create(options, null, null),
+                        null,
+                        identifier,
+                        new Path("oss://bucket/table"));
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(fileIO);
+        }
+        RESTTokenFileIO copy;
+        try (ObjectInputStream in =
+                new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            copy = (RESTTokenFileIO) in.readObject();
+        }
+
+        assertThat(copy.expirationSafeTimeMillis()).isEqualTo(Duration.ofMinutes(5).toMillis());
     }
 }
