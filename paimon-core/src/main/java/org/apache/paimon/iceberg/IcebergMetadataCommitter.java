@@ -27,7 +27,7 @@ import javax.annotation.Nullable;
  * Commit Iceberg metadata to metastore. Each kind of Iceberg catalog should have its own
  * implementation.
  */
-public interface IcebergMetadataCommitter {
+public interface IcebergMetadataCommitter extends AutoCloseable {
 
     String identifier();
 
@@ -35,4 +35,8 @@ public interface IcebergMetadataCommitter {
 
     void commitMetadata(
             IcebergMetadata newIcebergMetadata, @Nullable IcebergMetadata baseIcebergMetadata);
+
+    /** Releases the clients this committer holds. The default holds none. */
+    @Override
+    default void close() throws Exception {}
 }

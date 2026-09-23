@@ -684,6 +684,11 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         restCatalog.dropTable(icebergTableIdentifier, false);
     }
 
+    @Override
+    public void close() throws IOException {
+        restCatalog.close();
+    }
+
     // -------------------------------------------------------------------------------------
     // metadata updates
     // -------------------------------------------------------------------------------------
