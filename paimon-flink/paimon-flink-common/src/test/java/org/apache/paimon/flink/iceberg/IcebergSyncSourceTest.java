@@ -110,6 +110,57 @@ class IcebergSyncSourceTest {
     }
 
     @Test
+    void testOnlyTablesWithAMatchingOptionAreSelected() throws Exception {
+        createTable("on", Collections.singletonMap("x.enabled", "true"));
+        createTable("off", Collections.singletonMap("x.enabled", "false"));
+        createTable("unset", Collections.emptyMap());
+        write("on");
+        write("off");
+        write("unset");
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.singletonList("x.enabled=true"));
+        assertThat(names(reader.discover())).containsExactly("db.on@1");
+    }
+
+    @Test
+    void testAnyOfSeveralFiltersSelects() throws Exception {
+        createTable("a", Collections.singletonMap("x.enabled", "true"));
+        createTable("b", Collections.singletonMap("y.enabled", "true"));
+        write("a");
+        write("b");
+        IcebergSyncSource.Reader reader =
+                reader(
+                        Pattern.compile("db\\..*"),
+                        java.util.Arrays.asList("x.enabled=true", "y.enabled=true"));
+        assertThat(names(reader.discover())).containsExactlyInAnyOrder("db.a@1", "db.b@1");
+    }
+
+    @Test
+    void testATableThatTurnsTheOptionOffIsNeitherSyncedNorDropped() throws Exception {
+        createTable("t", Collections.singletonMap("x.enabled", "true"));
+        write("t");
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.singletonList("x.enabled=true"));
+        assertThat(names(reader.discover())).containsExactly("db.t@1");
+        catalog.alterTable(
+                Identifier.create("db", "t"),
+                Collections.singletonList(
+                        org.apache.paimon.schema.SchemaChange.setOption("x.enabled", "false")),
+                false);
+        write("t");
+        assertThat(reader.discover()).as("not selected").isEmpty();
+        assertThat(reader.discover()).as("and not dropped").isEmpty();
+        assertThat(reader.discover()).isEmpty();
+    }
+
+    @Test
+    void testAFilterWithoutAnEqualsSignIsRefused() {
+        assertThatThrownBy(() -> IcebergSyncSource.parseFilter("nope"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--table_option_filter needs key=value, got 'nope'");
+    }
+
+    @Test
     void testATableIsDroppedOnlyAfterTwoConsecutiveMisses() throws Exception {
         createTable("t", Collections.emptyMap());
         write("t");

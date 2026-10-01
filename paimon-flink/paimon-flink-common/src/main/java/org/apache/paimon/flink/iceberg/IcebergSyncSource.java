@@ -65,7 +65,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
     private final Pattern databasePattern;
     private final Pattern includingPattern;
     @Nullable private final Pattern excludingPattern;
-    private final List<String> optionFilters;
+    private final List<Map.Entry<String, String>> optionFilters;
     private final Map<String, String> tableOptions;
     private final boolean isStreaming;
     private final long pollIntervalMillis;
@@ -83,7 +83,10 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         this.databasePattern = databasePattern;
         this.includingPattern = includingPattern;
         this.excludingPattern = excludingPattern;
-        this.optionFilters = new ArrayList<>(optionFilters);
+        this.optionFilters = new ArrayList<>();
+        for (String filter : optionFilters) {
+            this.optionFilters.add(parseFilter(filter));
+        }
         this.tableOptions = new HashMap<>(tableOptions);
         this.isStreaming = isStreaming;
         this.pollIntervalMillis = pollInterval.toMillis();
@@ -106,6 +109,33 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
 
     /** Consecutive polls a table must be missing from the catalog before its mirror is dropped. */
     static final int MISSES_BEFORE_DROP = 2;
+
+    /** {@code key=value}; the first {@code =} splits, so a value may hold one. */
+    public static Map.Entry<String, String> parseFilter(String filter) {
+        int eq = filter.indexOf('=');
+        if (eq <= 0 || eq == filter.length() - 1) {
+            throw new IllegalArgumentException(
+                    "--table_option_filter needs key=value, got '" + filter + "'");
+        }
+        return new java.util.AbstractMap.SimpleImmutableEntry<>(
+                filter.substring(0, eq).trim(), filter.substring(eq + 1).trim());
+    }
+
+    /**
+     * No filter selects every matching table; otherwise any filter whose key holds its value
+     * selects.
+     */
+    static boolean selected(Map<String, String> options, List<Map.Entry<String, String>> filters) {
+        if (filters.isEmpty()) {
+            return true;
+        }
+        for (Map.Entry<String, String> f : filters) {
+            if (f.getValue().equals(options.get(f.getKey()))) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** The tables whose full name matches the including pattern and not the excluding one. */
     static List<Identifier> matchingTables(
@@ -235,6 +265,13 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 return Collections.emptyList();
             }
             FileStoreTable original = (FileStoreTable) table;
+            if (!selected(original.options(), optionFilters)) {
+                // not selected is not gone: the table is forgotten, not dropped
+                lastEmitted.remove(id.getFullName());
+                uuids.remove(id.getFullName());
+                misses.remove(id.getFullName());
+                return Collections.emptyList();
+            }
             FileStoreTable mirrored;
             try {
                 IcebergSync.checkNotMirroredByWriters(original);

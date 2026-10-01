@@ -96,6 +96,32 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
     }
 
     @Test
+    public void testBatchSyncsOnlyTablesWithTheFilteredOption() throws Exception {
+        FileStoreTable on = createTable("on", Collections.singletonMap("x.enabled", "true"));
+        FileStoreTable off = createTable("off", Collections.emptyMap());
+        writeOne(on, 1, 10);
+        writeOne(off, 2, 20);
+
+        StreamExecutionEnvironment env = streamExecutionEnvironmentBuilder().batchMode().build();
+        createAction(
+                        IcebergSyncAction.class,
+                        "iceberg_sync",
+                        "--warehouse",
+                        warehouse,
+                        "--including_databases",
+                        database,
+                        "--table_option_filter",
+                        "x.enabled=true",
+                        "--table_conf",
+                        STORAGE_CONF)
+                .withStreamExecutionEnvironment(env)
+                .run();
+
+        assertThat(IcebergSync.lastMirroredSnapshot(mirror(on))).isEqualTo(1L);
+        assertThat(IcebergSync.lastMirroredSnapshot(mirror(off))).isEqualTo(-1L);
+    }
+
+    @Test
     public void testSingleTableForm() throws Exception {
         FileStoreTable t1 = createTable("t1", Collections.emptyMap());
         writeOne(t1, 1, 10);

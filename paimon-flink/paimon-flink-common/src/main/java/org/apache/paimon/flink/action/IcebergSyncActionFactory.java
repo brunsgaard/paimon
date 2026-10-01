@@ -32,6 +32,7 @@ public class IcebergSyncActionFactory implements ActionFactory {
     private static final String INCLUDING_DATABASES = "including_databases";
     private static final String INCLUDING_TABLES = "including_tables";
     private static final String EXCLUDING_TABLES = "excluding_tables";
+    private static final String TABLE_OPTION_FILTER = "table_option_filter";
     private static final String POLL_INTERVAL = "poll_interval";
 
     @Override
@@ -63,6 +64,10 @@ public class IcebergSyncActionFactory implements ActionFactory {
                     .excludingTables(params.get(EXCLUDING_TABLES));
         }
         action.withTableOptions(optionalConfigMap(params, TABLE_CONF));
+        if (params.has(TABLE_OPTION_FILTER)) {
+            action.withTableOptionFilters(
+                    new java.util.ArrayList<>(params.getMultiParameter(TABLE_OPTION_FILTER)));
+        }
         String pollInterval = params.get(POLL_INTERVAL);
         if (pollInterval != null) {
             action.withPollInterval(TimeUtils.parseDuration(pollInterval));
@@ -104,6 +109,9 @@ public class IcebergSyncActionFactory implements ActionFactory {
         System.out.println(
                 "--including_tables and --excluding_tables match the full name"
                         + " <database>.<table>; --excluding_tables wins over --including_tables.");
+        System.out.println(
+                "--table_option_filter <key>=<value>  select only tables whose options hold this"
+                        + " pair; repeat for any-of");
         System.out.println(
                 "--poll_interval is the time between two polls in streaming mode, default 10 s."
                         + " In batch mode every matching table is synced to its latest snapshot"

@@ -32,8 +32,9 @@ import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
-import java.util.Collections;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -50,6 +51,7 @@ public class IcebergSyncAction extends ActionBase {
     private Pattern includingPattern = Pattern.compile(".*");
     @Nullable private Pattern excludingPattern;
     private Map<String, String> tableOptions = new HashMap<>();
+    private List<String> tableOptionFilters = new ArrayList<>();
     private Duration pollInterval = Duration.ofSeconds(10);
 
     public IcebergSyncAction(Map<String, String> catalogConfig) {
@@ -90,6 +92,14 @@ public class IcebergSyncAction extends ActionBase {
         return this;
     }
 
+    public IcebergSyncAction withTableOptionFilters(List<String> filters) {
+        for (String f : filters) {
+            IcebergSyncSource.parseFilter(f);
+        }
+        this.tableOptionFilters = new ArrayList<>(filters);
+        return this;
+    }
+
     public IcebergSyncAction withPollInterval(Duration pollInterval) {
         this.pollInterval = pollInterval;
         return this;
@@ -106,7 +116,7 @@ public class IcebergSyncAction extends ActionBase {
                                 databasePattern,
                                 includingPattern,
                                 excludingPattern,
-                                Collections.emptyList(),
+                                tableOptionFilters,
                                 tableOptions,
                                 isStreaming,
                                 pollInterval),
