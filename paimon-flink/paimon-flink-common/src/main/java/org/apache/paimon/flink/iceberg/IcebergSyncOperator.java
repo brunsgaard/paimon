@@ -66,6 +66,12 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
 
     @VisibleForTesting
     public void syncTask(IcebergSyncTask task) throws Exception {
+        if (task.isDrop()) {
+            LOG.warn(
+                    "Ignoring the drop task of {}; dropping is not implemented yet.",
+                    task.fullName());
+            return;
+        }
         FileStoreTable table;
         try {
             table = (FileStoreTable) catalog.getTable(Identifier.create(task.database, task.table));

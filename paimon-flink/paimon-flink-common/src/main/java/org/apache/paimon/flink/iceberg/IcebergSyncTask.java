@@ -30,10 +30,21 @@ public class IcebergSyncTask implements Serializable {
     public final String table;
     public final long snapshotId;
 
+    /** The snapshot id of a drop task: the table is gone from the catalog, drop its mirror. */
+    public static final long DROP = -1L;
+
     public IcebergSyncTask(String database, String table, long snapshotId) {
         this.database = database;
         this.table = table;
         this.snapshotId = snapshotId;
+    }
+
+    public static IcebergSyncTask drop(String database, String table) {
+        return new IcebergSyncTask(database, table, DROP);
+    }
+
+    public boolean isDrop() {
+        return snapshotId == DROP;
     }
 
     public String fullName() {

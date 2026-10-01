@@ -105,6 +105,7 @@ public class IcebergSyncAction extends ActionBase {
                                 databasePattern,
                                 includingPattern,
                                 excludingPattern,
+                                java.util.Collections.emptyList(),
                                 tableOptions,
                                 isStreaming,
                                 pollInterval),

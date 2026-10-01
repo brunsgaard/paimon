@@ -41,10 +41,13 @@ import javax.annotation.Nullable;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -62,6 +65,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
     private final Pattern databasePattern;
     private final Pattern includingPattern;
     @Nullable private final Pattern excludingPattern;
+    private final List<String> optionFilters;
     private final Map<String, String> tableOptions;
     private final boolean isStreaming;
     private final long pollIntervalMillis;
@@ -71,6 +75,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
             Pattern databasePattern,
             Pattern includingPattern,
             @Nullable Pattern excludingPattern,
+            List<String> optionFilters,
             Map<String, String> tableOptions,
             boolean isStreaming,
             Duration pollInterval) {
@@ -78,6 +83,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         this.databasePattern = databasePattern;
         this.includingPattern = includingPattern;
         this.excludingPattern = excludingPattern;
+        this.optionFilters = new ArrayList<>(optionFilters);
         this.tableOptions = new HashMap<>(tableOptions);
         this.isStreaming = isStreaming;
         this.pollIntervalMillis = pollInterval.toMillis();
@@ -91,8 +97,15 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
     @Override
     public SourceReader<IcebergSyncTask, SimpleSourceSplit> createReader(
             SourceReaderContext context) {
+        return newReader();
+    }
+
+    Reader newReader() {
         return new Reader();
     }
+
+    /** Consecutive polls a table must be missing from the catalog before its mirror is dropped. */
+    static final int MISSES_BEFORE_DROP = 2;
 
     /** The tables whose full name matches the including pattern and not the excluding one. */
     static List<Identifier> matchingTables(
@@ -118,9 +131,13 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         return matching;
     }
 
-    private class Reader extends AbstractNonCoordinatedSourceReader<IcebergSyncTask> {
+    class Reader extends AbstractNonCoordinatedSourceReader<IcebergSyncTask> {
 
         private final Map<String, Long> lastEmitted = new HashMap<>();
+        private final Map<String, String> uuids = new HashMap<>();
+        /** Tables seen on an earlier poll and missing since: full name to consecutive misses. */
+        private final Map<String, Integer> misses = new HashMap<>();
+
         private final Deque<IcebergSyncTask> queue = new ArrayDeque<>();
         private transient Catalog catalog;
         private boolean passDone;
@@ -139,7 +156,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 if (passDone) {
                     Thread.sleep(pollIntervalMillis);
                 }
-                discover();
+                queue.addAll(discover());
                 passDone = true;
                 if (queue.isEmpty()) {
                     return isStreaming ? InputStatus.NOTHING_AVAILABLE : InputStatus.END_OF_INPUT;
@@ -149,46 +166,111 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
             return InputStatus.MORE_AVAILABLE;
         }
 
-        private void discover() throws Exception {
-            for (Identifier id :
-                    matchingTables(catalog, databasePattern, includingPattern, excludingPattern)) {
-                Table table;
-                try {
-                    table = catalog.getTable(id);
-                } catch (Catalog.TableNotExistException e) {
-                    continue;
+        /**
+         * One poll. A failed listing in streaming mode is one skipped poll: nothing is emitted and
+         * no miss is counted, so a catalog outage never drops a mirror. In batch mode it fails.
+         */
+        List<IcebergSyncTask> discover() throws Exception {
+            List<Identifier> matching;
+            try {
+                matching =
+                        matchingTables(
+                                catalog, databasePattern, includingPattern, excludingPattern);
+            } catch (Exception e) {
+                if (!isStreaming) {
+                    throw e;
                 }
-                if (!(table instanceof FileStoreTable)) {
-                    continue;
-                }
-                FileStoreTable original = (FileStoreTable) table;
-                FileStoreTable mirrored;
-                try {
-                    IcebergSync.checkNotMirroredByWriters(original);
-                    mirrored = IcebergSync.withMirrorDefaults(original, tableOptions);
-                } catch (IllegalArgumentException e) {
-                    if (!isStreaming) {
-                        throw e;
-                    }
-                    LOG.error("{}", e.getMessage());
-                    continue;
-                }
-                List<Long> pending = IcebergSync.pendingSnapshots(mirrored);
-                long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
-                if (!pending.isEmpty() && pending.get(0) <= from) {
-                    // a pending id at or below the mark means the table was rolled back or
-                    // recreated; the mark belongs to the old timeline
-                    from = -1;
-                }
-                for (long snapshotId : pending) {
-                    if (snapshotId > from) {
-                        queue.add(
-                                new IcebergSyncTask(
-                                        id.getDatabaseName(), id.getObjectName(), snapshotId));
-                        lastEmitted.put(id.getFullName(), snapshotId);
-                    }
+                LOG.warn("Listing the catalog failed; this poll is skipped.", e);
+                return Collections.emptyList();
+            }
+            Set<String> present = new HashSet<>();
+            List<List<IcebergSyncTask>> perTable = new ArrayList<>();
+            for (Identifier id : matching) {
+                present.add(id.getFullName());
+                misses.remove(id.getFullName());
+                List<IcebergSyncTask> pending = pendingTasks(id);
+                if (!pending.isEmpty()) {
+                    perTable.add(pending);
                 }
             }
+            List<IcebergSyncTask> tasks = interleave(perTable);
+            for (String gone : new ArrayList<>(lastEmitted.keySet())) {
+                if (present.contains(gone)) {
+                    continue;
+                }
+                int n = misses.merge(gone, 1, Integer::sum);
+                if (n < MISSES_BEFORE_DROP) {
+                    LOG.info(
+                            "Table {} is missing from the catalog ({} of {} polls).",
+                            gone,
+                            n,
+                            MISSES_BEFORE_DROP);
+                    continue;
+                }
+                Identifier id = Identifier.fromString(gone);
+                LOG.warn("Table {} is gone from the catalog; its mirror will be dropped.", gone);
+                tasks.add(IcebergSyncTask.drop(id.getDatabaseName(), id.getObjectName()));
+                lastEmitted.remove(gone);
+                uuids.remove(gone);
+                misses.remove(gone);
+            }
+            return tasks;
+        }
+
+        /** Until Task 6: the tables one after the other. */
+        List<IcebergSyncTask> interleave(List<List<IcebergSyncTask>> perTable) {
+            List<IcebergSyncTask> out = new ArrayList<>();
+            perTable.forEach(out::addAll);
+            return out;
+        }
+
+        private List<IcebergSyncTask> pendingTasks(Identifier id) throws Exception {
+            Table table;
+            try {
+                table = catalog.getTable(id);
+            } catch (Catalog.TableNotExistException e) {
+                return Collections.emptyList();
+            }
+            if (!(table instanceof FileStoreTable)) {
+                return Collections.emptyList();
+            }
+            FileStoreTable original = (FileStoreTable) table;
+            FileStoreTable mirrored;
+            try {
+                IcebergSync.checkNotMirroredByWriters(original);
+                mirrored = IcebergSync.withMirrorDefaults(original, tableOptions);
+            } catch (IllegalArgumentException e) {
+                if (!isStreaming) {
+                    throw e;
+                }
+                LOG.error("{}", e.getMessage());
+                return Collections.emptyList();
+            }
+            List<Long> pending = IcebergSync.pendingSnapshots(mirrored);
+            long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
+            String uuid = original.uuid();
+            String knownUuid = uuids.put(id.getFullName(), uuid);
+            if (knownUuid != null && !knownUuid.equals(uuid)) {
+                // the table was dropped and created again; the mark belongs to the old table
+                from = -1;
+            }
+            if (!pending.isEmpty() && pending.get(0) < from) {
+                // a pending id below the mark means the table was rolled back; the mark
+                // belongs to the old timeline
+                from = -1;
+            }
+            List<IcebergSyncTask> tasks = new ArrayList<>();
+            for (long snapshotId : pending) {
+                if (snapshotId > from) {
+                    tasks.add(
+                            new IcebergSyncTask(
+                                    id.getDatabaseName(), id.getObjectName(), snapshotId));
+                    lastEmitted.put(id.getFullName(), snapshotId);
+                }
+            }
+            // a table with nothing to mirror yet is still one we watch for a drop
+            lastEmitted.putIfAbsent(id.getFullName(), -1L);
+            return tasks;
         }
 
         @Override
