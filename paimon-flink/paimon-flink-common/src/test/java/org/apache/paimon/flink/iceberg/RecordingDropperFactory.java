@@ -27,11 +27,16 @@ import org.apache.paimon.table.FileStoreTable;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Records the drops it is asked for. Registered with the identifier {@code recording}. */
+/**
+ * Records the drops it is asked for. Registered with the identifier {@code recording}. While {@link
+ * #failing} is set, a drop throws and is not recorded.
+ */
 public class RecordingDropperFactory implements IcebergMetadataCommitterFactory {
 
     static final List<String> drops = new CopyOnWriteArrayList<>();
+    static final AtomicBoolean failing = new AtomicBoolean(false);
 
     @Override
     public String identifier() {
@@ -45,6 +50,11 @@ public class RecordingDropperFactory implements IcebergMetadataCommitterFactory 
 
     @Override
     public IcebergMirrorDropper createDropper(Options options, Identifier table) {
-        return () -> drops.add(table.getFullName());
+        return () -> {
+            if (failing.get()) {
+                throw new IllegalStateException("The catalog is not reachable.");
+            }
+            drops.add(table.getFullName());
+        };
     }
 }
