@@ -131,12 +131,12 @@ public class IcebergSyncAction extends ActionBase {
                                 isStreaming,
                                 pollInterval),
                         WatermarkStrategy.noWatermarks(),
-                        "iceberg-sync-source",
+                        "write-iceberg-metadata-source",
                         new JavaTypeInfo<>(IcebergSyncTask.class))
                 .forceNonParallel()
                 .keyBy(IcebergSyncTask::fullName)
                 .process(new IcebergSyncOperator(catalogLoader(), tableOptions, configuration))
-                .name("iceberg-sync")
+                .name("write-iceberg-metadata")
                 .sinkTo(new DiscardingSink<>());
     }
 

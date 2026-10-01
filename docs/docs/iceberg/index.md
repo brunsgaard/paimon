@@ -64,9 +64,9 @@ configuration and credentials.
 ## Mirror from a Separate Job
 
 By default every job that commits to a table also publishes the Iceberg metadata. To keep writers
-free of the mirror, leave the `metadata.iceberg.*` options off the table and run the `write_iceberg_metadata`
-action instead. It mirrors every snapshot since the last mirrored one, in order, so the Iceberg
-history follows the Paimon history.
+free of the mirror, leave the `metadata.iceberg.*` options off the table and run the
+`write_iceberg_metadata` action instead. It mirrors every snapshot since the last mirrored one, in
+order, so the Iceberg history follows the Paimon history.
 
 ```bash
 <FLINK_HOME>/bin/flink run \
@@ -136,7 +136,7 @@ Prometheus names are `flink_taskmanager_job_task_operator_iceberg_metadata_table
 | `latest_snapshot_id` | source | The latest snapshot id of the Paimon table. |
 | `pending_snapshots` | source | The number of snapshots not yet mirrored. |
 | `mirrored_snapshot_id` | operator | The last mirrored snapshot id. It reads -1 after a restart until the next sync. |
-| `mirrored_snapshot_timestamp_ms` | operator | The commit time of the last mirrored snapshot. |
+| `mirrored_snapshot_timestamp_ms` | operator | The commit time of the last mirrored snapshot. It reads -1 after a restart until the next sync. |
 | `on_hold` | operator | 1 while the table is held after a failure, else 0. |
 
 The counters have the Prometheus names `flink_taskmanager_job_task_operator_iceberg_metadata_<counter>`:
