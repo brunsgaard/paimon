@@ -50,7 +50,7 @@ class IcebergSyncOperatorTest {
     }
 
     @Test
-    void testADropTaskDropsTheMirrorAndForgetsTheSync() throws Exception {
+    void testADropTaskDropsTheMirror() throws Exception {
         RecordingDropperFactory.drops.clear();
         IcebergSyncOperator operator = operatorWithStorage("recording");
         operator.syncTask(IcebergSyncTask.drop("db", "t"));

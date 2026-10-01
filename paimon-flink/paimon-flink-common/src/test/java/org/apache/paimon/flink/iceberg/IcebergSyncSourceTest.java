@@ -161,6 +161,25 @@ class IcebergSyncSourceTest {
     }
 
     @Test
+    void testTheDropTaskCarriesTheMirrorNamingOfTheTable() throws Exception {
+        createTable("t", Collections.singletonMap("metadata.iceberg.table", "other_name"));
+        write("t");
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.emptyList());
+        reader.discover();
+        catalog.dropTable(Identifier.create("db", "t"), false);
+        reader.discover();
+        List<IcebergSyncTask> tasks = reader.discover();
+        assertThat(tasks).hasSize(1);
+        assertThat(tasks.get(0).mirrorNaming)
+                .containsExactly(
+                        java.util.Collections.singletonMap("metadata.iceberg.table", "other_name")
+                                .entrySet()
+                                .iterator()
+                                .next());
+    }
+
+    @Test
     void testATableIsDroppedOnlyAfterTwoConsecutiveMisses() throws Exception {
         createTable("t", Collections.emptyMap());
         write("t");

@@ -38,6 +38,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /** Mirrors the snapshots of the tasks it receives, with one {@link IcebergSync} per table. */
@@ -100,12 +101,19 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         cached.sync.sync(task.snapshotId);
     }
 
+    /**
+     * Drops the mirror of a table that is gone. The reader keeps no checkpointed state, so a drop
+     * that fails, for example in a REST outage, is lost after a restart: the table never appears in
+     * the listing again.
+     */
     private void drop(IcebergSyncTask task) throws Exception {
         Cached cached = syncs.remove(task.fullName());
         if (cached != null) {
             cached.sync.close();
         }
-        Options options = Options.fromMap(tableOptions);
+        Map<String, String> merged = new HashMap<>(task.mirrorNaming);
+        merged.putAll(tableOptions);
+        Options options = Options.fromMap(merged);
         String storage = options.get(IcebergOptions.METADATA_ICEBERG_STORAGE.key());
         IcebergMirrorDropper dropper = null;
         if (storage != null) {
@@ -114,7 +122,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
                         FactoryUtil.discoverFactory(
                                         IcebergSyncOperator.class.getClassLoader(),
                                         IcebergMetadataCommitterFactory.class,
-                                        storage.trim())
+                                        storage.trim().toLowerCase(Locale.ROOT))
                                 .createDropper(
                                         options, Identifier.create(task.database, task.table));
             } catch (FactoryException e) {
@@ -128,10 +136,8 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
                     storage);
             return;
         }
-        try {
-            dropper.drop();
-        } finally {
-            dropper.close();
+        try (IcebergMirrorDropper d = dropper) {
+            d.drop();
         }
     }
 

@@ -891,6 +891,10 @@ public class IcebergRestMetadataCommitterTest {
     }
 
     private FileStoreTable createAndMirrorOnce() throws Exception {
+        return createAndMirrorOnce(Collections.emptyMap());
+    }
+
+    private FileStoreTable createAndMirrorOnce(Map<String, String> customOptions) throws Exception {
         RowType rowType =
                 RowType.of(
                         new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
@@ -901,7 +905,7 @@ public class IcebergRestMetadataCommitterTest {
                         Collections.singletonList("k"),
                         1,
                         randomFormat(),
-                        Collections.emptyMap());
+                        customOptions);
         String commitUser = UUID.randomUUID().toString();
         TableWriteImpl<?> write = table.newWrite(commitUser);
         TableCommitImpl commit = table.newCommit(commitUser);
@@ -925,9 +929,42 @@ public class IcebergRestMetadataCommitterTest {
         dropper.drop();
         dropper.close();
         assertThat(restCatalog.tableExists(id)).isFalse();
-        assertThat(table.fileIO().exists(metadataDir))
+        assertThat(table.fileIO().exists(new Path(metadataDir, "v1.metadata.json")))
                 .as("purge is false; the files belong to the table")
                 .isTrue();
+    }
+
+    @Test
+    public void testADropUsesTheTablesOwnMirrorName() throws Exception {
+        Map<String, String> naming = new HashMap<>();
+        naming.put(IcebergOptions.METASTORE_TABLE.key(), "other_name");
+        FileStoreTable table = createAndMirrorOnce(naming);
+        TableIdentifier own = TableIdentifier.of("mydb", "other_name");
+        TableIdentifier bystander = TableIdentifier.of("mydb", "t");
+        assertThat(restCatalog.tableExists(own)).isTrue();
+        restCatalog.dropTable(bystander, false);
+        restCatalog.createTable(
+                bystander, new Schema(NestedField.required(1, "id", Types.IntegerType.get())));
+
+        // the job options hold the storage and the REST settings, not the naming
+        Map<String, String> jobOptions = new HashMap<>(table.options());
+        jobOptions.remove(IcebergOptions.METASTORE_TABLE.key());
+        Options catalogOptions = new Options();
+        catalogOptions.set("warehouse", new Path(tempDir.toString(), "other-wh").toString());
+        org.apache.paimon.flink.iceberg.IcebergSyncOperator operator =
+                new org.apache.paimon.flink.iceberg.IcebergSyncOperator(
+                        () ->
+                                org.apache.paimon.catalog.CatalogFactory.createCatalog(
+                                        org.apache.paimon.catalog.CatalogContext.create(
+                                                catalogOptions)),
+                        jobOptions);
+        operator.open((org.apache.flink.api.common.functions.OpenContext) null);
+        operator.syncTask(
+                org.apache.paimon.flink.iceberg.IcebergSyncTask.drop("mydb", "t", naming));
+        operator.close();
+
+        assertThat(restCatalog.tableExists(own)).isFalse();
+        assertThat(restCatalog.tableExists(bystander)).isTrue();
     }
 
     @Test

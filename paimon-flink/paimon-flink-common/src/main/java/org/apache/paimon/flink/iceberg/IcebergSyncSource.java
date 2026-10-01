@@ -165,6 +165,8 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
 
         private final Map<String, Long> lastEmitted = new HashMap<>();
         private final Map<String, String> uuids = new HashMap<>();
+        /** The options that name the Iceberg table of each table seen: full name to options. */
+        private final Map<String, Map<String, String>> mirrorNamings = new HashMap<>();
         /** Tables seen on an earlier poll and missing since: full name to consecutive misses. */
         private final Map<String, Integer> misses = new HashMap<>();
 
@@ -239,7 +241,12 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 }
                 Identifier id = Identifier.fromString(gone);
                 LOG.warn("Table {} is gone from the catalog; its mirror will be dropped.", gone);
-                tasks.add(IcebergSyncTask.drop(id.getDatabaseName(), id.getObjectName()));
+                tasks.add(
+                        IcebergSyncTask.drop(
+                                id.getDatabaseName(),
+                                id.getObjectName(),
+                                mirrorNamings.getOrDefault(gone, Collections.emptyMap())));
+                mirrorNamings.remove(gone);
                 lastEmitted.remove(gone);
                 uuids.remove(gone);
                 misses.remove(gone);
@@ -269,6 +276,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 // not selected is not gone: the table is forgotten, not dropped
                 lastEmitted.remove(id.getFullName());
                 uuids.remove(id.getFullName());
+                mirrorNamings.remove(id.getFullName());
                 misses.remove(id.getFullName());
                 return Collections.emptyList();
             }
@@ -283,6 +291,14 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 LOG.error("{}", e.getMessage());
                 return Collections.emptyList();
             }
+            Map<String, String> naming = new HashMap<>();
+            for (String key : IcebergSyncTask.MIRROR_NAMING_KEYS) {
+                String value = mirrored.options().get(key);
+                if (value != null) {
+                    naming.put(key, value);
+                }
+            }
+            mirrorNamings.put(id.getFullName(), naming);
             List<Long> pending = IcebergSync.pendingSnapshots(mirrored);
             long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
             String uuid = original.uuid();
