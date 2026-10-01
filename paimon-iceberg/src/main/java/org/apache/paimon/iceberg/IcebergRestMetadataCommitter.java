@@ -143,16 +143,8 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
     }
 
     static TableIdentifier icebergIdentifier(Options options, Identifier identifier) {
-        String icebergDatabase = options.get(IcebergOptions.METASTORE_DATABASE);
-        String icebergTable = options.get(IcebergOptions.METASTORE_TABLE);
-        String database =
-                icebergDatabase != null && !icebergDatabase.isEmpty()
-                        ? icebergDatabase
-                        : identifier.getDatabaseName();
-        String tableName =
-                icebergTable != null && !icebergTable.isEmpty()
-                        ? icebergTable
-                        : identifier.getTableName();
+        String database = IcebergOptions.icebergDatabaseName(options, identifier);
+        String tableName = IcebergOptions.icebergTableName(options, identifier);
         return TableIdentifier.of(Namespace.of(database), tableName);
     }
 

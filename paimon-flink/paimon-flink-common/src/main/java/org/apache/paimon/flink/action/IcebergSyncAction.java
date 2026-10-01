@@ -26,6 +26,7 @@ import org.apache.paimon.iceberg.IcebergOptions;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
 
@@ -114,6 +115,11 @@ public class IcebergSyncAction extends ActionBase {
         boolean isStreaming =
                 env.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
                         == RuntimeExecutionMode.STREAMING;
+        HashMap<String, String> configuration = new HashMap<>();
+        if (env.getConfiguration() instanceof Configuration) {
+            configuration.putAll(((Configuration) env.getConfiguration()).toMap());
+        }
+        configuration.putAll(tableOptions);
         env.fromSource(
                         new IcebergSyncSource(
                                 catalogLoader(),
@@ -129,7 +135,7 @@ public class IcebergSyncAction extends ActionBase {
                         new JavaTypeInfo<>(IcebergSyncTask.class))
                 .forceNonParallel()
                 .keyBy(IcebergSyncTask::fullName)
-                .process(new IcebergSyncOperator(catalogLoader(), tableOptions))
+                .process(new IcebergSyncOperator(catalogLoader(), tableOptions, configuration))
                 .name("iceberg-sync")
                 .sinkTo(new DiscardingSink<>());
     }

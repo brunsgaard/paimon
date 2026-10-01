@@ -386,7 +386,8 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
     public void testSyncOperatorSkipsAMissingTable() throws Exception {
         Map<String, String> options = new HashMap<>();
         options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "table-location");
-        IcebergSyncOperator operator = new IcebergSyncOperator(uncachedCatalogLoader(), options);
+        IcebergSyncOperator operator =
+                new IcebergSyncOperator(uncachedCatalogLoader(), options, new HashMap<>());
         operator.open((OpenContext) null);
         try {
             operator.syncTask(new IcebergSyncTask(database, "nope", 1L));
@@ -496,7 +497,8 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
         writeOne(table, 1, 10);
         Map<String, String> options = new HashMap<>();
         options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "table-location");
-        IcebergSyncOperator operator = new IcebergSyncOperator(uncachedCatalogLoader(), options);
+        IcebergSyncOperator operator =
+                new IcebergSyncOperator(uncachedCatalogLoader(), options, new HashMap<>());
         operator.open((OpenContext) null);
         try {
             operator.syncTask(new IcebergSyncTask(database, "pk", 1L));

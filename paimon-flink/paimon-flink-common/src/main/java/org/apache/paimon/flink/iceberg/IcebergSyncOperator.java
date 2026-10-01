@@ -28,6 +28,7 @@ import org.apache.paimon.iceberg.IcebergMetadataCommitterFactory;
 import org.apache.paimon.iceberg.IcebergMirrorDropper;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergSync;
+import org.apache.paimon.iceberg.IcebergSyncListener;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.SerializableFunction;
@@ -42,10 +43,16 @@ import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.ServiceConfigurationError;
+import java.util.ServiceLoader;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * Mirrors the snapshots of the tasks it receives, with one {@link IcebergSync} per table.
@@ -57,6 +64,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * replaces a held sync, because the table is gone. A held sync of a table that is gone, and a held
  * drop of a table that exists again, release the hold. The holds are not checkpointed: after a
  * restart the source emits the pending snapshots again, but a held drop is lost.
+ *
+ * <p>The {@link IcebergSyncListener}s found with {@link ServiceLoader} hear each mirrored snapshot
+ * and each dropped mirror on the task thread. A listener call that fails is counted and never
+ * changes the outcome of a sync.
  */
 public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyncTask, Void> {
 
@@ -66,6 +77,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
 
     private final CatalogLoader catalogLoader;
     private final Map<String, String> tableOptions;
+    private final HashMap<String, String> configuration;
 
     private transient Catalog catalog;
     private transient Map<String, Cached> syncs;
@@ -74,13 +86,19 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     private transient Counter synced;
     private transient Counter failureCounter;
     private transient Counter dropped;
+    private transient Counter listenerFailures;
+    private transient List<IcebergSyncListener> listeners;
     private transient Map<String, MetricGroup> tableGroups;
     private transient Map<String, Long> mirroredId;
     private transient Map<String, Long> mirroredTimestampMs;
 
-    public IcebergSyncOperator(CatalogLoader catalogLoader, Map<String, String> tableOptions) {
+    public IcebergSyncOperator(
+            CatalogLoader catalogLoader,
+            Map<String, String> tableOptions,
+            HashMap<String, String> configuration) {
         this.catalogLoader = catalogLoader;
         this.tableOptions = new HashMap<>(tableOptions);
+        this.configuration = new HashMap<>(configuration);
     }
 
     @Override
@@ -99,6 +117,68 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         synced = metricGroup.counter("snapshots_synced");
         failureCounter = metricGroup.counter("sync_failures");
         dropped = metricGroup.counter("mirrors_dropped");
+        listenerFailures = metricGroup.counter("listener_failures");
+        openListeners();
+    }
+
+    /**
+     * Finds the listeners through the user code class loader. A listener that cannot load or open
+     * is counted and not used.
+     */
+    private void openListeners() {
+        listeners = new ArrayList<>();
+        ClassLoader userCode = Thread.currentThread().getContextClassLoader();
+        Iterator<IcebergSyncListener> found =
+                ServiceLoader.load(
+                                IcebergSyncListener.class,
+                                userCode == null
+                                        ? IcebergSyncOperator.class.getClassLoader()
+                                        : userCode)
+                        .iterator();
+        while (true) {
+            IcebergSyncListener listener;
+            try {
+                if (!found.hasNext()) {
+                    return;
+                }
+                listener = found.next();
+            } catch (ServiceConfigurationError | RuntimeException e) {
+                listenerFailures.inc();
+                LOG.warn("A listener cannot be loaded and is not used.", e);
+                continue;
+            }
+            try {
+                listener.open(new HashMap<>(configuration));
+                listeners.add(listener);
+            } catch (Exception | LinkageError e) {
+                listenerFailures.inc();
+                LOG.warn(
+                        "Listener {} failed to open and is not used.",
+                        listener.getClass().getName(),
+                        e);
+            }
+        }
+    }
+
+    /** Calls each listener; a failure is logged and counted, and the others are still called. */
+    private void notifyListeners(Consumer<IcebergSyncListener> call) {
+        for (IcebergSyncListener listener : listeners) {
+            try {
+                call.accept(listener);
+            } catch (Exception | LinkageError e) {
+                listenerFailures.inc();
+                LOG.warn("Listener {} failed.", listener.getClass().getName(), e);
+            }
+        }
+    }
+
+    private void notifySynced(
+            Identifier id, FileStoreTable table, long snapshotId, long timestampMs) {
+        Options options = Options.fromMap(table.options());
+        String icebergDatabase = IcebergOptions.icebergDatabaseName(options, id);
+        String icebergTable = IcebergOptions.icebergTableName(options, id);
+        notifyListeners(
+                l -> l.onSynced(id, snapshotId, timestampMs, icebergDatabase, icebergTable));
     }
 
     /** Registers the gauges of a table once; a dropped table keeps its group and reads -1. */
@@ -120,34 +200,49 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     SerializableFunction<FileStoreTable, Long> mirroredIdReader =
             table -> IcebergSync.lastMirroredSnapshot(table);
 
-    /** Records the mirrored snapshot of a table. A metric never fails a sync. */
-    private void recordMirrored(String fullName, FileStoreTable table, long snapshotId, int count) {
+    /**
+     * Records the mirrored snapshot of a table. A metric never fails a sync. Returns the snapshot
+     * time, or -1 when it cannot be read.
+     */
+    private long recordMirrored(String fullName, FileStoreTable table, long snapshotId, int count) {
+        long timestampMs = -1L;
         try {
             registerTable(fullName);
             synced.inc(count);
             try {
-                mirroredTimestampMs.put(
-                        fullName, table.snapshotManager().snapshot(snapshotId).timeMillis());
+                timestampMs = table.snapshotManager().snapshot(snapshotId).timeMillis();
+                mirroredTimestampMs.put(fullName, timestampMs);
             } finally {
                 mirroredId.put(fullName, snapshotId);
             }
         } catch (Exception e) {
             LOG.debug("Table {}: no metric for snapshot {}.", fullName, snapshotId, e);
         }
+        return timestampMs;
     }
 
     /**
      * Records the snapshots a successful retry mirrored; the id is the one in the mirror's hint.
      */
-    private void recordRetried(String fullName, FileStoreTable table, int count) {
+    private void recordRetried(Identifier identifier, FileStoreTable table, int count) {
+        String fullName = identifier.getFullName();
         synced.inc(count);
+        long id = -1L;
+        long timestampMs = -1L;
         try {
-            long id = mirroredIdReader.apply(IcebergSync.withMirrorDefaults(table, tableOptions));
+            id = mirroredIdReader.apply(IcebergSync.withMirrorDefaults(table, tableOptions));
             if (id >= 0) {
-                recordMirrored(fullName, table, id, 0);
+                timestampMs = recordMirrored(fullName, table, id, 0);
             }
         } catch (Exception e) {
             LOG.debug("Table {}: no metric for the retry.", fullName, e);
+        }
+        if (id >= 0) {
+            notifySynced(
+                    identifier,
+                    IcebergSync.withMirrorDefaults(table, tableOptions),
+                    id,
+                    timestampMs);
         }
     }
 
@@ -228,7 +323,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         int mirrored = cached(task.fullName(), table).sync.syncPending();
         onHold.remove(task.fullName());
         if (mirrored > 0) {
-            recordRetried(task.fullName(), table, mirrored);
+            recordRetried(Identifier.create(task.database, task.table), table, mirrored);
         }
         LOG.info(
                 "Table {} recovered after {} failures; {} snapshots mirrored.",
@@ -304,7 +399,12 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             return;
         }
         if (cached(task.fullName(), table).sync.sync(task.snapshotId)) {
-            recordMirrored(task.fullName(), table, task.snapshotId, 1);
+            long timestampMs = recordMirrored(task.fullName(), table, task.snapshotId, 1);
+            notifySynced(
+                    Identifier.create(task.database, task.table),
+                    IcebergSync.withMirrorDefaults(table, tableOptions),
+                    task.snapshotId,
+                    timestampMs);
         }
     }
 
@@ -377,6 +477,10 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             d.drop();
         }
         dropped.inc();
+        Identifier id = Identifier.create(task.database, task.table);
+        String icebergDatabase = IcebergOptions.icebergDatabaseName(options, id);
+        String icebergTable = IcebergOptions.icebergTableName(options, id);
+        notifyListeners(l -> l.onDropped(id, icebergDatabase, icebergTable));
     }
 
     /** What to retry for a held table: the sync of its pending snapshots, or its drop. */
@@ -405,13 +509,30 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
 
     @Override
     public void close() throws Exception {
-        if (syncs != null) {
-            for (Cached cached : syncs.values()) {
-                cached.sync.close();
+        try {
+            if (syncs != null) {
+                for (Cached cached : syncs.values()) {
+                    cached.sync.close();
+                }
             }
+            if (catalog != null) {
+                catalog.close();
+            }
+        } finally {
+            closeListeners();
         }
-        if (catalog != null) {
-            catalog.close();
+    }
+
+    private void closeListeners() {
+        if (listeners == null) {
+            return;
+        }
+        for (IcebergSyncListener listener : listeners) {
+            try {
+                listener.close();
+            } catch (Exception | LinkageError e) {
+                LOG.warn("Listener {} failed to close.", listener.getClass().getName(), e);
+            }
         }
     }
 }

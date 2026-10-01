@@ -45,9 +45,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -78,7 +81,8 @@ class IcebergSyncOperatorTest {
                 Collections.singletonMap(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), storage);
         return new IcebergSyncOperator(
                 () -> CatalogFactory.createCatalog(CatalogContext.create(catalogOptions)),
-                mirrorOptions);
+                mirrorOptions,
+                new HashMap<>(Collections.singletonMap("job.key", "job.value")));
     }
 
     private IcebergSyncOperator operatorWithStorage(String storage) {
@@ -112,6 +116,9 @@ class IcebergSyncOperatorTest {
 
     @AfterEach
     void tearDown() throws Exception {
+        ThrowingListener.armed = false;
+        ThrowingListener.linkageError = false;
+        ThrowingListener.openFails = false;
         RecordingDropperFactory.failing.set(false);
         if (harness != null) {
             harness.close();
@@ -122,10 +129,15 @@ class IcebergSyncOperatorTest {
     }
 
     private void createTable(String name) throws Exception {
+        createTable(name, Collections.emptyMap());
+    }
+
+    private void createTable(String name, Map<String, String> options) throws Exception {
         Schema schema =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
                         .column("v", DataTypes.STRING())
+                        .options(options)
                         .build();
         catalog.createTable(Identifier.create("db", name), schema, false);
         write(name);
@@ -148,6 +160,126 @@ class IcebergSyncOperatorTest {
 
     private static IcebergSyncTask task(String database, String table, long snapshotId) {
         return new IcebergSyncTask(database, table, snapshotId);
+    }
+
+    private static long listenerFailures(IcebergSyncOperatorTest test) {
+        return TestingMetricUtils.getCounter(test.metrics(), "listener_failures").getCount();
+    }
+
+    private static List<String> syncedEvents() {
+        return RecordingListener.events.stream()
+                .filter(e -> e.startsWith("synced"))
+                .collect(Collectors.toList());
+    }
+
+    @Test
+    void testTheListenerHearsEverySyncAndDrop() throws Exception {
+        RecordingListener.events.clear();
+        startHarness("table-location");
+        createTable("t");
+        harness.processElement(task("db", "t", 1), 0);
+        IcebergSyncOperator dropping = operatorWithStorage("recording");
+        dropping.syncTask(IcebergSyncTask.drop("db", "t"));
+        dropping.close();
+        assertThat(RecordingListener.events)
+                .containsExactly("open", "synced db.t@1 -> db.t", "open", "dropped db.t -> db.t");
+        assertThat(RecordingListener.configuration).containsEntry("job.key", "job.value");
+    }
+
+    @Test
+    void testTheListenerGetsTheIcebergNamesOfTheTable() throws Exception {
+        RecordingListener.events.clear();
+        startHarness("table-location");
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.METASTORE_DATABASE.key(), "ice_db");
+        options.put(IcebergOptions.METASTORE_TABLE.key(), "ice_t");
+        createTable("named", options);
+        harness.processElement(task("db", "named", 1), 0);
+        assertThat(syncedEvents()).containsExactly("synced db.named@1 -> ice_db.ice_t");
+
+        IcebergSyncOperator dropping = operatorWithStorage("recording");
+        dropping.syncTask(IcebergSyncTask.drop("db", "named", options));
+        dropping.close();
+        assertThat(RecordingListener.events).contains("dropped db.named -> ice_db.ice_t");
+    }
+
+    @Test
+    void testADropWithoutADropperIsNotAnnounced() throws Exception {
+        RecordingListener.events.clear();
+        IcebergSyncOperator dropping = operatorWithStorage("table-location");
+        dropping.syncTask(IcebergSyncTask.drop("db", "t"));
+        dropping.close();
+        assertThat(RecordingListener.events).containsExactly("open");
+    }
+
+    @Test
+    void testAListenerThatThrowsDoesNotFailTheSync() throws Exception {
+        RecordingListener.events.clear();
+        startHarness("table-location");
+        createTable("t");
+        ThrowingListener.armed = true;
+        harness.processElement(task("db", "t", 1), 0);
+        assertThat(IcebergSync.lastMirroredSnapshot(mirrored("t"))).isEqualTo(1L);
+        assertThat(operator.failures("db.t")).isEqualTo(0);
+        assertThat(listenerFailures(this)).isEqualTo(1L);
+        assertThat(syncedEvents()).as("the other listener still hears it").hasSize(1);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "sync_failures").getCount())
+                .isEqualTo(0L);
+    }
+
+    @Test
+    void testAListenerThatCannotLoadAClassDoesNotFailTheDrop() throws Exception {
+        RecordingListener.events.clear();
+        ThrowingListener.linkageError = true;
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "mirrors_dropped").getCount())
+                .isEqualTo(1L);
+        assertThat(listenerFailures(this)).isEqualTo(1L);
+        assertThat(operator.failures("db.gone")).isEqualTo(0);
+        assertThat(RecordingListener.events).contains("dropped db.gone -> db.gone");
+    }
+
+    @Test
+    void testAListenerThatCannotOpenIsNotCalled() throws Exception {
+        RecordingListener.events.clear();
+        ThrowingListener.openFails = true;
+        ThrowingListener.calls.set(0);
+        startHarness("table-location");
+        createTable("t");
+        harness.processElement(task("db", "t", 1), 0);
+        assertThat(IcebergSync.lastMirroredSnapshot(mirrored("t"))).isEqualTo(1L);
+        assertThat(ThrowingListener.calls.get()).isEqualTo(0);
+        assertThat(listenerFailures(this)).isEqualTo(1L);
+        assertThat(syncedEvents()).hasSize(1);
+    }
+
+    @Test
+    void testARetryThatSucceedsCallsTheListenerOnce() throws Exception {
+        RecordingListener.events.clear();
+        startHarness("table-location");
+        createTable("bad");
+        harness.processElement(task("db", "bad", 1), 0);
+        assertThat(syncedEvents()).isEmpty();
+        failing.set(false);
+        harness.setProcessingTime(30_000);
+        assertThat(syncedEvents()).containsExactly("synced db.bad@1 -> db.bad");
+    }
+
+    @Test
+    void testARetryWhoseHintCannotBeReadCallsNoListener() throws Exception {
+        RecordingListener.events.clear();
+        startHarness("table-location");
+        operator.mirroredIdReader =
+                table -> {
+                    throw new java.io.UncheckedIOException(new java.io.IOException("read"));
+                };
+        createTable("bad");
+        harness.processElement(task("db", "bad", 1), 0);
+        failing.set(false);
+        harness.setProcessingTime(30_000);
+        assertThat(IcebergSync.lastMirroredSnapshot(mirrored("bad"))).isEqualTo(1L);
+        assertThat(syncedEvents()).isEmpty();
     }
 
     @Test
