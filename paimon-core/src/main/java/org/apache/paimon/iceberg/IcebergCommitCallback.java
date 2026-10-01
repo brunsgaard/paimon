@@ -1636,6 +1636,7 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             published.add(added.getRight());
         }
         DataFilePathFactories factories = new DataFilePathFactories(fileStorePathFactory);
+        int resolved = 0;
         for (ManifestEntry entry :
                 table.store()
                         .newScan()
@@ -1644,9 +1645,21 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                         .plan()
                         .files()) {
             String path = factories.get(entry.partition(), entry.bucket()).toPath(entry).toString();
-            if (basePaths.contains(path) && !addedFiles.containsKey(path)) {
-                published.add(entry.file());
+            if (basePaths.contains(path)) {
+                resolved++;
+                if (!addedFiles.containsKey(path)) {
+                    published.add(entry.file());
+                }
             }
+        }
+        if (resolved < basePaths.size()) {
+            LOG.warn(
+                    "Table {}: {} of {} live files of the Iceberg base are not in snapshot {};"
+                            + " the schema check skips them.",
+                    table.fullName(),
+                    basePaths.size() - resolved,
+                    basePaths.size(),
+                    snapshotId);
         }
         return published;
     }

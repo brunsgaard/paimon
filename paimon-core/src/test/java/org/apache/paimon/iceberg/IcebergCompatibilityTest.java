@@ -1071,6 +1071,54 @@ public class IcebergCompatibilityTest {
     }
 
     @Test
+    public void testPromotionOverOldFilesOfAPrimaryKeyTablePublishes() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT(), DataTypes.INT()},
+                        new String[] {"p", "k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType, Collections.singletonList("p"), Arrays.asList("p", "k"), 1);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 1, 10));
+        write.write(GenericRow.of(2, 2, 20));
+        write.compact(intPartition(1), 0, true);
+        write.compact(intPartition(2), 0, true);
+        commit.commit(1, write.prepareCommit(true, 1));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 1, 10)", "Record(2, 2, 20)");
+
+        new FileSystemSchemaManager(table.fileIO(), table.location())
+                .commitChanges(SchemaChange.updateColumnType("v", DataTypes.BIGINT()));
+        table = table.copyWithLatestSchema();
+        write.close();
+        commit.close();
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        // partition 1 keeps its max level file of schema 0 in the published base
+        write.write(GenericRow.of(2, 3, 30L));
+        write.compact(intPartition(2), 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        assertThat(getIcebergTable().schema().findField("v").type())
+                .isEqualTo(org.apache.iceberg.types.Types.LongType.get());
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 1, 10)", "Record(2, 2, 20)", "Record(2, 3, 30)");
+        write.close();
+        commit.close();
+    }
+
+    private static BinaryRow intPartition(int value) {
+        BinaryRow partition = new BinaryRow(1);
+        BinaryRowWriter writer = new BinaryRowWriter(partition);
+        writer.writeInt(0, value);
+        writer.complete();
+        return partition;
+    }
+
+    @Test
     public void testIcebergSnapshotExpire() throws Exception {
         RowType rowType =
                 RowType.of(
