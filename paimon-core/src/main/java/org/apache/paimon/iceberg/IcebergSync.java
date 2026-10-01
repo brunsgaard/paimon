@@ -299,12 +299,31 @@ public final class IcebergSync implements AutoCloseable {
         return !(described && hint >= snapshotId);
     }
 
-    /** Mirrors every pending snapshot and returns how many changed the mirror. */
+    /**
+     * Mirrors every pending snapshot and returns how many changed the mirror. A snapshot that the
+     * callback refuses with {@link IcebergSchemaNotReadableException} is skipped when a later
+     * snapshot is pending, because a later full compaction can make the table readable again. The
+     * later snapshot is built from a scan, as its base is the last published snapshot. The refusal
+     * is thrown only for the last pending snapshot.
+     */
     public int syncPending() {
         int mirrored = 0;
-        for (long id : pendingSnapshots()) {
-            if (sync(id)) {
-                mirrored++;
+        List<Long> pending = pendingSnapshots();
+        for (int i = 0; i < pending.size(); i++) {
+            long id = pending.get(i);
+            try {
+                if (sync(id)) {
+                    mirrored++;
+                }
+            } catch (IcebergSchemaNotReadableException e) {
+                if (i == pending.size() - 1) {
+                    throw e;
+                }
+                LOG.warn(
+                        "Table {}: snapshot {} is not published and the next snapshot is tried: {}",
+                        table.fullName(),
+                        id,
+                        e.getMessage());
             }
         }
         return mirrored;

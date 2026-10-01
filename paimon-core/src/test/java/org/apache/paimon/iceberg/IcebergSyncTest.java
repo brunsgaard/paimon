@@ -25,6 +25,7 @@ import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.FileSystemCatalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.disk.IOManagerImpl;
 import org.apache.paimon.fs.Path;
@@ -35,6 +36,7 @@ import org.apache.paimon.options.ExpireConfig;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.TableWriteImpl;
@@ -48,6 +50,7 @@ import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -384,7 +387,86 @@ public class IcebergSyncTest {
         }
     }
 
+    @Test
+    public void testRefusedSnapshotIsSkippedWhenAFullCompactionFollows() throws Exception {
+        FileStoreTable table = createStringValueTable();
+        write(table, 1, GenericRow.of(1, BinaryString.fromString("10")));
+        try (IcebergSync sync = new IcebergSync(table.copy(mirrorOptions()))) {
+            assertThat(sync.syncPending()).isEqualTo(1);
+        }
+
+        table = changeValueToInt(table);
+        write(table, 2, GenericRow.of(2, 20));
+        try (IcebergSync sync = new IcebergSync(table.copy(mirrorOptions()))) {
+            assertThatThrownBy(sync::syncPending)
+                    .isInstanceOf(IcebergSchemaNotReadableException.class);
+        }
+        assertThat(IcebergSync.lastMirroredSnapshot(table.copy(mirrorOptions()))).isEqualTo(1L);
+        assertThat(getIcebergResult("s")).containsExactly("Record(1, 10)");
+
+        fullCompaction(table, 3);
+        try (IcebergSync sync = new IcebergSync(table.copy(mirrorOptions()))) {
+            assertThat(sync.pendingSnapshots()).containsExactly(2L, 3L);
+            assertThat(sync.syncPending()).isEqualTo(1);
+            assertThat(sync.pendingSnapshots()).isEmpty();
+        }
+        assertThat(IcebergSync.lastMirroredSnapshot(table.copy(mirrorOptions()))).isEqualTo(3L);
+        assertThat(loadIcebergTable("s").schema().findField("v").type())
+                .isEqualTo(Types.IntegerType.get());
+        assertThat(getIcebergResult("s"))
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+    }
+
+    @Test
+    public void testSyncOfTheRefusedSnapshotAloneThrows() throws Exception {
+        FileStoreTable table = createStringValueTable();
+        write(table, 1, GenericRow.of(1, BinaryString.fromString("10")));
+        try (IcebergSync sync = new IcebergSync(table.copy(mirrorOptions()))) {
+            assertThat(sync.sync(1L)).isTrue();
+        }
+
+        table = changeValueToInt(table);
+        write(table, 2, GenericRow.of(2, 20));
+        fullCompaction(table, 3);
+        try (IcebergSync sync = new IcebergSync(table.copy(mirrorOptions()))) {
+            assertThatThrownBy(() -> sync.sync(2L))
+                    .isInstanceOf(IcebergSchemaNotReadableException.class);
+            assertThat(IcebergSync.lastMirroredSnapshot(table.copy(mirrorOptions()))).isEqualTo(1L);
+            assertThat(sync.sync(3L)).isTrue();
+        }
+        assertThat(IcebergSync.lastMirroredSnapshot(table.copy(mirrorOptions()))).isEqualTo(3L);
+        assertThat(getIcebergResult("s"))
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+    }
+
     // ------------------------------------------------------------------------------------------
+
+    /** A primary key table with one bucket, so a full compaction rewrites every file. */
+    private FileStoreTable createStringValueTable() throws Exception {
+        return createPaimonTable(
+                "s",
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.STRING()},
+                        new String[] {"k", "v"}),
+                Collections.singletonList("k"),
+                1,
+                Collections.emptyMap());
+    }
+
+    private static FileStoreTable changeValueToInt(FileStoreTable table) throws Exception {
+        table.schemaManager().commitChanges(SchemaChange.updateColumnType("v", DataTypes.INT()));
+        return table.copyWithLatestSchema();
+    }
+
+    private static void fullCompaction(FileStoreTable table, long commitIdentifier)
+            throws Exception {
+        String user = UUID.randomUUID().toString();
+        try (TableWriteImpl<?> write = table.newWrite(user);
+                TableCommitImpl commit = table.newCommit(user)) {
+            write.compact(BinaryRow.EMPTY_ROW, 0, true);
+            commit.commit(commitIdentifier, write.prepareCommit(true, commitIdentifier));
+        }
+    }
 
     private static Map<String, String> mirrorOptions() {
         Map<String, String> mirror = new HashMap<>();
@@ -420,6 +502,16 @@ public class IcebergSyncTest {
             int numBuckets,
             Map<String, String> customOptions)
             throws Exception {
+        return createPaimonTable(name, ROW_TYPE, primaryKeys, numBuckets, customOptions);
+    }
+
+    private FileStoreTable createPaimonTable(
+            String name,
+            RowType rowType,
+            List<String> primaryKeys,
+            int numBuckets,
+            Map<String, String> customOptions)
+            throws Exception {
         LocalFileIO fileIO = LocalFileIO.create();
         Path path = new Path(tempDir.toString());
         Options options = new Options(customOptions);
@@ -428,7 +520,7 @@ public class IcebergSyncTest {
         options.set(CoreOptions.TARGET_FILE_SIZE, MemorySize.ofKibiBytes(32));
         Schema schema =
                 new Schema(
-                        ROW_TYPE.getFields(),
+                        rowType.getFields(),
                         Collections.emptyList(),
                         primaryKeys,
                         options.toMap(),
@@ -442,9 +534,16 @@ public class IcebergSyncTest {
     }
 
     private List<String> getIcebergResult() throws Exception {
+        return getIcebergResult("t");
+    }
+
+    private org.apache.iceberg.Table loadIcebergTable(String name) {
         HadoopCatalog icebergCatalog = new HadoopCatalog(new Configuration(), tempDir.toString());
-        org.apache.iceberg.Table icebergTable =
-                icebergCatalog.loadTable(TableIdentifier.of("mydb.db", "t"));
+        return icebergCatalog.loadTable(TableIdentifier.of("mydb.db", name));
+    }
+
+    private List<String> getIcebergResult(String name) throws Exception {
+        org.apache.iceberg.Table icebergTable = loadIcebergTable(name);
         List<String> actual = new ArrayList<>();
         try (CloseableIterable<Record> result = IcebergGenerics.read(icebergTable).build()) {
             for (Record record : result) {
