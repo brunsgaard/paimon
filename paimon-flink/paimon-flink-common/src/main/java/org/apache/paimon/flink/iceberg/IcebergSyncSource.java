@@ -254,9 +254,10 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 // the table was dropped and created again; the mark belongs to the old table
                 from = -1;
             }
-            if (!pending.isEmpty() && pending.get(0) < from) {
-                // a pending id below the mark means the table was rolled back; the mark
-                // belongs to the old timeline
+            if (!pending.isEmpty()
+                    && pending.get(0) <= IcebergSync.lastMirroredSnapshot(mirrored)) {
+                // pendingSnapshots returns an id at or below the hint only after a rollback;
+                // the mark belongs to the old timeline
                 from = -1;
             }
             List<IcebergSyncTask> tasks = new ArrayList<>();

@@ -21,11 +21,14 @@ package org.apache.paimon.flink.iceberg;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.CatalogLoader;
+import org.apache.paimon.catalog.DelegateCatalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.iceberg.IcebergOptions;
+import org.apache.paimon.iceberg.IcebergSync;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
@@ -47,6 +50,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class IcebergSyncSourceTest {
 
@@ -157,8 +161,65 @@ class IcebergSyncSourceTest {
         assertThat(reader.discover()).as("still there, no drop, nothing new").isEmpty();
     }
 
+    @Test
+    void testARollbackThatReusesTheSnapshotIdIsEmittedAgain() throws Exception {
+        createTable("t", Collections.emptyMap());
+        write("t");
+        write("t");
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.emptyList());
+        assertThat(names(reader.discover())).containsExactly("db.t@2");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(Identifier.create("db", "t"));
+        try (IcebergSync sync =
+                new IcebergSync(IcebergSync.withMirrorDefaults(table, mirrorOptions))) {
+            sync.sync(2);
+        }
+        assertThat(reader.discover()).isEmpty();
+        table.rollbackTo(1);
+        write("t");
+        assertThat(names(reader.discover())).containsExactly("db.t@2");
+    }
+
+    @Test
+    void testALaggingOperatorIsNotReEmittedEverything() throws Exception {
+        createTable("t", Collections.emptyMap());
+        write("t");
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.emptyList());
+        assertThat(names(reader.discover())).containsExactly("db.t@1");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(Identifier.create("db", "t"));
+        try (IcebergSync sync =
+                new IcebergSync(IcebergSync.withMirrorDefaults(table, mirrorOptions))) {
+            sync.sync(1);
+        }
+        write("t");
+        write("t");
+        assertThat(names(reader.discover())).containsExactly("db.t@2", "db.t@3");
+        assertThat(reader.discover()).isEmpty();
+    }
+
+    @Test
+    void testABatchListingFailureFails() throws Exception {
+        createTable("t", Collections.emptyMap());
+        FailingListCatalog failing = new FailingListCatalog(catalog);
+        failing.fail = true;
+        IcebergSyncSource source =
+                new IcebergSyncSource(
+                        () -> failing,
+                        Pattern.compile("db"),
+                        Pattern.compile("db\\..*"),
+                        null,
+                        Collections.emptyList(),
+                        mirrorOptions,
+                        false,
+                        Duration.ofSeconds(1));
+        IcebergSyncSource.Reader reader = source.newReader();
+        reader.start();
+        assertThatThrownBy(reader::discover).hasMessageContaining("listing failed");
+    }
+
     /** Forwards to a catalog and fails listDatabases on demand. */
-    static final class FailingListCatalog extends org.apache.paimon.catalog.DelegateCatalog {
+    static final class FailingListCatalog extends DelegateCatalog {
         boolean fail;
 
         FailingListCatalog(Catalog wrapped) {
@@ -166,7 +227,7 @@ class IcebergSyncSourceTest {
         }
 
         @Override
-        public org.apache.paimon.catalog.CatalogLoader catalogLoader() {
+        public CatalogLoader catalogLoader() {
             return wrapped.catalogLoader();
         }
 

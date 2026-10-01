@@ -32,6 +32,7 @@ import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -105,7 +106,7 @@ public class IcebergSyncAction extends ActionBase {
                                 databasePattern,
                                 includingPattern,
                                 excludingPattern,
-                                java.util.Collections.emptyList(),
+                                Collections.emptyList(),
                                 tableOptions,
                                 isStreaming,
                                 pollInterval),
