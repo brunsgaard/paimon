@@ -47,6 +47,7 @@ import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -69,13 +70,13 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
     public void testAPollIntervalUnderASecondIsRefused() {
         IcebergSyncAction action =
                 new IcebergSyncAction(Collections.singletonMap("warehouse", warehouse));
-        assertThatThrownBy(() -> action.withPollInterval(java.time.Duration.ZERO))
+        assertThatThrownBy(() -> action.withPollInterval(Duration.ZERO))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("--poll_interval must be at least 1 s");
-        assertThatThrownBy(() -> action.withPollInterval(java.time.Duration.ofMillis(999)))
+        assertThatThrownBy(() -> action.withPollInterval(Duration.ofMillis(999)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("--poll_interval must be at least 1 s");
-        action.withPollInterval(java.time.Duration.ofSeconds(1));
+        action.withPollInterval(Duration.ofSeconds(1));
     }
 
     @Test

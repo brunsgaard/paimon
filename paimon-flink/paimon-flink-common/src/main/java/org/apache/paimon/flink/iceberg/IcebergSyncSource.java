@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -309,7 +310,18 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 }
             }
             mirrorNamings.put(id.getFullName(), naming);
-            List<Long> pending = IcebergSync.pendingSnapshots(mirrored);
+            List<Long> pending;
+            long hint;
+            try {
+                pending = IcebergSync.pendingSnapshots(mirrored);
+                hint = pending.isEmpty() ? -1 : IcebergSync.lastMirroredSnapshot(mirrored);
+            } catch (IllegalStateException | UncheckedIOException e) {
+                if (!isStreaming) {
+                    throw e;
+                }
+                LOG.warn("Table {}: skipped in this poll: {}", id.getFullName(), e.getMessage());
+                return Collections.emptyList();
+            }
             long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
             String uuid = original.uuid();
             String knownUuid = uuids.put(id.getFullName(), uuid);
@@ -317,8 +329,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 // the table was dropped and created again; the mark belongs to the old table
                 from = -1;
             }
-            if (!pending.isEmpty()
-                    && pending.get(0) <= IcebergSync.lastMirroredSnapshot(mirrored)) {
+            if (!pending.isEmpty() && pending.get(0) <= hint) {
                 // pendingSnapshots returns an id at or below the hint only after a rollback;
                 // the mark belongs to the old timeline
                 from = -1;

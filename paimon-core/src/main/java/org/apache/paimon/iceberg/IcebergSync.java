@@ -113,7 +113,8 @@ public final class IcebergSync implements AutoCloseable {
     }
 
     static final int HINT_READS = 3;
-    static long HINT_READ_DELAY_MILLIS = 200;
+    /** The pause between two reads of an empty hint. Tests set it to 0. */
+    public static long HINT_READ_DELAY_MILLIS = 200;
 
     /** The snapshot id in {@code version-hint.text}, or -1 when the table has no mirror yet. */
     public static long lastMirroredSnapshot(FileStoreTable table) {

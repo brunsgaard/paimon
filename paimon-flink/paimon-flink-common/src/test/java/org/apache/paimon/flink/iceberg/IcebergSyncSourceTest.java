@@ -155,6 +155,33 @@ class IcebergSyncSourceTest {
     }
 
     @Test
+    void testATableWithAnUnreadableHintIsSkippedAndTheOthersGoOn() throws Exception {
+        createTable("bad", Collections.emptyMap());
+        createTable("good", Collections.emptyMap());
+        write("bad");
+        write("good");
+        FileStoreTable bad = (FileStoreTable) catalog.getTable(Identifier.create("db", "bad"));
+        Path hint =
+                new Path(
+                        IcebergCommitCallback.catalogTableMetadataPath(
+                                IcebergSync.withMirrorDefaults(bad, mirrorOptions)),
+                        "version-hint.text");
+        bad.fileIO().overwriteFileUtf8(hint, "");
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.emptyList());
+        long delay = IcebergSync.HINT_READ_DELAY_MILLIS;
+        IcebergSync.HINT_READ_DELAY_MILLIS = 0;
+        try {
+            assertThat(names(reader.discover())).containsExactly("db.good@1");
+            assertThat(names(reader.discover())).as("still skipped, not dropped").isEmpty();
+        } finally {
+            IcebergSync.HINT_READ_DELAY_MILLIS = delay;
+        }
+        bad.fileIO().delete(hint, false);
+        assertThat(names(reader.discover())).containsExactly("db.bad@1");
+    }
+
+    @Test
     void testAFilterWithoutAnEqualsSignIsRefused() {
         assertThatThrownBy(() -> IcebergSyncSource.parseFilter("nope"))
                 .isInstanceOf(IllegalArgumentException.class)
