@@ -41,7 +41,6 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -190,6 +189,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         @Nullable private final MetricGroup metricGroup;
         @Nullable private final Counter polls;
         @Nullable private final Counter failedPolls;
+        @Nullable private final Counter tableFailures;
         private final Map<String, MetricGroup> tableGroups = new HashMap<>();
         private final Map<String, Long> latestSnapshotId = new ConcurrentHashMap<>();
         private final Map<String, Long> pendingSnapshots = new ConcurrentHashMap<>();
@@ -199,10 +199,12 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 metricGroup = null;
                 polls = null;
                 failedPolls = null;
+                tableFailures = null;
             } else {
                 metricGroup = context.addGroup("iceberg_metadata");
                 polls = metricGroup.counter("polls");
                 failedPolls = metricGroup.counter("failed_polls");
+                tableFailures = metricGroup.counter("table_failures");
             }
         }
 
@@ -347,13 +349,31 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
             }
         }
 
+        /**
+         * The tasks of one table. In streaming mode a table whose reads fail is skipped for this
+         * poll and counted: it stays present and keeps its mark, so it is neither dropped nor
+         * emitted again from the start. In batch mode the failure fails the job.
+         */
         private List<IcebergSyncTask> pendingTasks(Identifier id) throws Exception {
-            Table table;
             try {
-                table = catalog.getTable(id);
+                return readPendingTasks(id);
             } catch (Catalog.TableNotExistException e) {
                 return Collections.emptyList();
+            } catch (Exception e) {
+                if (!isStreaming) {
+                    throw e;
+                }
+                if (tableFailures != null) {
+                    tableFailures.inc();
+                }
+                LOG.warn("Table {}: skipped in this poll: {}", id.getFullName(), e.toString());
+                LOG.debug("Table {}: the failure of this poll.", id.getFullName(), e);
+                return Collections.emptyList();
             }
+        }
+
+        private List<IcebergSyncTask> readPendingTasks(Identifier id) throws Exception {
+            Table table = catalog.getTable(id);
             if (!(table instanceof FileStoreTable)) {
                 return Collections.emptyList();
             }
@@ -386,21 +406,11 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 }
             }
             mirrorNamings.put(id.getFullName(), naming);
-            List<Long> pending;
-            long hint;
-            try {
-                pending = IcebergSync.pendingSnapshots(mirrored);
-                hint = pending.isEmpty() ? -1 : IcebergSync.lastMirroredSnapshot(mirrored);
-            } catch (IllegalStateException | UncheckedIOException e) {
-                if (!isStreaming) {
-                    throw e;
-                }
-                LOG.warn("Table {}: skipped in this poll: {}", id.getFullName(), e.getMessage());
-                return Collections.emptyList();
-            }
+            List<Long> pending = IcebergSync.pendingSnapshots(mirrored);
+            long hint = pending.isEmpty() ? -1 : IcebergSync.lastMirroredSnapshot(mirrored);
+            String uuid = original.uuid();
             report(id.getFullName(), original, pending);
             long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
-            String uuid = original.uuid();
             String knownUuid = uuids.put(id.getFullName(), uuid);
             if (knownUuid != null && !knownUuid.equals(uuid)) {
                 // the table was dropped and created again; the mark belongs to the old table

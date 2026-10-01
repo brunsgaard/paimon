@@ -26,28 +26,39 @@ import org.apache.paimon.catalog.DelegateCatalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.SeekableInputStream;
+import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.iceberg.IcebergCommitCallback;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergSync;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.types.DataTypes;
 
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -368,9 +379,85 @@ class IcebergSyncSourceTest {
         assertThatThrownBy(reader::discover).hasMessageContaining("listing failed");
     }
 
-    /** Forwards to a catalog and fails listDatabases on demand. */
+    IcebergSyncSource.Reader reader(Catalog source, boolean streaming, MetricGroup metrics) {
+        IcebergSyncSource syncSource =
+                new IcebergSyncSource(
+                        () -> source,
+                        Pattern.compile("db.*"),
+                        Pattern.compile("db.*\\..*"),
+                        null,
+                        Collections.emptyList(),
+                        mirrorOptions,
+                        streaming,
+                        Duration.ofSeconds(1));
+        IcebergSyncSource.Reader reader = syncSource.newReader(metrics);
+        reader.start();
+        return reader;
+    }
+
+    static long counter(RecordingMetricGroup metrics, String name) {
+        return metrics.counters.get(name).getCount();
+    }
+
+    @Test
+    void testATableWhoseGetTableFailsIsSkippedAndTheOthersGoOn() throws Exception {
+        createTable("bad", Collections.emptyMap());
+        createTable("good", Collections.emptyMap());
+        write("bad");
+        write("good");
+        FailingListCatalog failing = new FailingListCatalog(catalog);
+        RecordingMetricGroup metrics = new RecordingMetricGroup();
+        IcebergSyncSource.Reader reader = reader(failing, true, metrics);
+        assertThat(names(reader.discover())).containsExactlyInAnyOrder("db.bad@1", "db.good@1");
+        write("bad");
+        write("good");
+        failing.failGetTable.add("db.bad");
+        assertThat(names(reader.discover())).containsExactly("db.good@2");
+        assertThat(names(reader.discover())).as("still skipped, not dropped").isEmpty();
+        assertThat(counter(metrics, "table_failures")).isEqualTo(2L);
+        failing.failGetTable.clear();
+        assertThat(names(reader.discover())).containsExactly("db.bad@2");
+    }
+
+    @Test
+    void testATableWhoseSnapshotReadFailsIsSkippedAndTheOthersGoOn() throws Exception {
+        createTable("bad", Collections.emptyMap());
+        createTable("good", Collections.emptyMap());
+        write("bad");
+        write("good");
+        FailingListCatalog failing = new FailingListCatalog(catalog);
+        RecordingMetricGroup metrics = new RecordingMetricGroup();
+        IcebergSyncSource.Reader reader = reader(failing, true, metrics);
+        assertThat(names(reader.discover())).containsExactlyInAnyOrder("db.bad@1", "db.good@1");
+        write("bad");
+        write("good");
+        failing.failSnapshots.add("db.bad");
+        assertThat(names(reader.discover())).containsExactly("db.good@2");
+        assertThat(names(reader.discover())).as("still skipped, not dropped").isEmpty();
+        assertThat(counter(metrics, "table_failures")).isEqualTo(2L);
+        failing.failSnapshots.clear();
+        assertThat(names(reader.discover())).containsExactly("db.bad@2");
+    }
+
+    @Test
+    void testABatchTableFailureFails() throws Exception {
+        createTable("bad", Collections.emptyMap());
+        write("bad");
+        FailingListCatalog failing = new FailingListCatalog(catalog);
+        failing.failSnapshots.add("db.bad");
+        IcebergSyncSource.Reader reader = reader(failing, false, null);
+        assertThatThrownBy(reader::discover).hasMessageContaining("latest snapshot id");
+    }
+
+    /**
+     * Forwards to a catalog. It fails listDatabases, the listing of a database, getTable of a
+     * table, or the snapshot reads of a table on demand.
+     */
     static final class FailingListCatalog extends DelegateCatalog {
         boolean fail;
+        final Set<String> failListing = new HashSet<>();
+        final Set<String> failGetTable = new HashSet<>();
+        final Set<String> failSnapshots = new HashSet<>();
 
         FailingListCatalog(Catalog wrapped) {
             super(wrapped);
@@ -387,6 +474,80 @@ class IcebergSyncSourceTest {
                 throw new RuntimeException("listing failed");
             }
             return super.listDatabases();
+        }
+
+        @Override
+        public List<String> listTables(String databaseName) throws DatabaseNotExistException {
+            if (failListing.contains(databaseName)) {
+                throw new RuntimeException("listing of " + databaseName + " failed");
+            }
+            return super.listTables(databaseName);
+        }
+
+        @Override
+        public Table getTable(Identifier identifier) throws TableNotExistException {
+            if (failGetTable.contains(identifier.getFullName())) {
+                throw new RuntimeException("getTable failed");
+            }
+            Table table = super.getTable(identifier);
+            if (!failSnapshots.contains(identifier.getFullName())) {
+                return table;
+            }
+            FileStoreTable fileStoreTable = (FileStoreTable) table;
+            return FileStoreTableFactory.create(
+                    new FailingSnapshotFileIO(),
+                    fileStoreTable.location(),
+                    fileStoreTable.schema(),
+                    fileStoreTable.catalogEnvironment());
+        }
+    }
+
+    /** Keeps the counters of the source; the per-table groups are not kept. */
+    static final class RecordingMetricGroup extends UnregisteredMetricsGroup {
+        final Map<String, Counter> counters = new HashMap<>();
+
+        @Override
+        public MetricGroup addGroup(String name) {
+            return this;
+        }
+
+        @Override
+        public MetricGroup addGroup(String key, String value) {
+            return new UnregisteredMetricsGroup();
+        }
+
+        @Override
+        public Counter counter(String name) {
+            return counters.computeIfAbsent(name, n -> new SimpleCounter());
+        }
+    }
+
+    /** A local file system on which every read of the snapshot directory fails. */
+    static final class FailingSnapshotFileIO extends LocalFileIO {
+        private static final long serialVersionUID = 1L;
+
+        private static void check(Path path) throws IOException {
+            if (path.toString().contains("/snapshot")) {
+                throw new IOException("snapshot read failed: " + path);
+            }
+        }
+
+        @Override
+        public SeekableInputStream newInputStream(Path path) throws IOException {
+            check(path);
+            return super.newInputStream(path);
+        }
+
+        @Override
+        public FileStatus[] listStatus(Path path) throws IOException {
+            check(path);
+            return super.listStatus(path);
+        }
+
+        @Override
+        public boolean exists(Path path) throws IOException {
+            check(path);
+            return super.exists(path);
         }
     }
 }

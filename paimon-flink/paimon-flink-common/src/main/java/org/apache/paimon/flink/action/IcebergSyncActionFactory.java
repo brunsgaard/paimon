@@ -130,7 +130,9 @@ public class IcebergSyncActionFactory implements ActionFactory {
 
         System.out.println("Failures:");
         System.out.println(
-                "  A failing table is held and retried after 30 s, after 2 min, and then every"
+                "  A table whose catalog or snapshot reads fail in the source is skipped for"
+                        + " that poll and counted in table_failures; it is not dropped. A failing"
+                        + " table is held and retried after 30 s, after 2 min, and then every"
                         + " 10 min. The other tables go on. Holds and pending drops are in memory"
                         + " only, so a restart loses a pending drop; a person drops that Iceberg"
                         + " table.");
@@ -143,7 +145,7 @@ public class IcebergSyncActionFactory implements ActionFactory {
                         + " mirrored_snapshot_timestamp_ms and on_hold (operator)."
                         + " mirrored_snapshot_id reads -1 after a restart until the next sync.");
         System.out.println(
-                "  Counters: polls, failed_polls, snapshots_synced, sync_failures,"
+                "  Counters: polls, failed_polls, table_failures, snapshots_synced, sync_failures,"
                         + " mirrors_dropped, listener_failures.");
         System.out.println();
 

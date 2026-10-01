@@ -122,8 +122,9 @@ keeps the metadata. A catalog listing that fails drops nothing.
 
 `--poll_interval` must be at least 1 s.
 
-A failing table is held and retried after 30 s, after 2 min, and then every 10 min. The other tables
-go on. Holds and pending drops are in memory only, so a restart loses a pending drop. A person drops
+A table whose catalog or snapshot reads fail in the source is skipped for that poll and counted in
+`table_failures`. It is not dropped, and the next poll reads it again. A failing table is held and
+retried after 30 s, after 2 min, and then every 10 min. The other tables go on. Holds and pending drops are in memory only, so a restart loses a pending drop. A person drops
 that Iceberg table.
 
 #### Metrics
@@ -140,8 +141,8 @@ Prometheus names are `flink_taskmanager_job_task_operator_iceberg_metadata_table
 | `on_hold` | operator | 1 while the table is held after a failure, else 0. |
 
 The counters have the Prometheus names `flink_taskmanager_job_task_operator_iceberg_metadata_<counter>`:
-`polls`, `failed_polls`, `snapshots_synced`, `sync_failures`, `mirrors_dropped` and
-`listener_failures`.
+`polls`, `failed_polls`, `table_failures`, `snapshots_synced`, `sync_failures`, `mirrors_dropped`
+and `listener_failures`.
 
 #### Listeners
 
