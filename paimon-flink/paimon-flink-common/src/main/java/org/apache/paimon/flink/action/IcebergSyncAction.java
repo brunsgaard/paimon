@@ -143,6 +143,6 @@ public class IcebergSyncAction extends ActionBase {
     @Override
     public void run() throws Exception {
         build();
-        execute("iceberg_sync");
+        execute("write_iceberg_metadata");
     }
 }

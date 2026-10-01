@@ -35,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 public class IcebergSyncProcedureITCase extends CatalogITCaseBase {
 
     private static final String CALL =
-            "CALL sys.iceberg_sync(`table` => 'default.T',"
+            "CALL sys.write_iceberg_metadata(`table` => 'default.T',"
                     + " `options` => 'metadata.iceberg.storage=table-location')";
 
     @Test

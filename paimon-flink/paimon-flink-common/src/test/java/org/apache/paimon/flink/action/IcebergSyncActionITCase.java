@@ -77,6 +77,25 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
     private static final String STORAGE_CONF = "metadata.iceberg.storage=table-location";
 
     @Test
+    public void testTheOldActionNameIsGone() {
+        assertThatThrownBy(
+                        () ->
+                                createAction(
+                                        IcebergSyncAction.class,
+                                        "iceberg_sync",
+                                        "--warehouse",
+                                        warehouse,
+                                        "--database",
+                                        "default",
+                                        "--table",
+                                        "t",
+                                        "--table_conf",
+                                        STORAGE_CONF))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("Unknown action \"iceberg_sync\"");
+    }
+
+    @Test
     public void testAPollIntervalUnderASecondIsRefused() {
         IcebergSyncAction action =
                 new IcebergSyncAction(Collections.singletonMap("warehouse", warehouse));
@@ -102,7 +121,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
         StreamExecutionEnvironment env = streamExecutionEnvironmentBuilder().batchMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--including_databases",
@@ -129,7 +148,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
         StreamExecutionEnvironment env = streamExecutionEnvironmentBuilder().batchMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--including_databases",
@@ -153,7 +172,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
         StreamExecutionEnvironment env = streamExecutionEnvironmentBuilder().batchMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--database",
@@ -176,7 +195,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                         () ->
                                 createAction(
                                         IcebergSyncAction.class,
-                                        "iceberg_sync",
+                                        "write_iceberg_metadata",
                                         "--warehouse",
                                         warehouse,
                                         "--database",
@@ -197,7 +216,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                         () ->
                                 createAction(
                                                 IcebergSyncAction.class,
-                                                "iceberg_sync",
+                                                "write_iceberg_metadata",
                                                 "--warehouse",
                                                 warehouse,
                                                 "--database",
@@ -220,7 +239,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                 streamExecutionEnvironmentBuilder().streamingMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--including_databases",
@@ -276,7 +295,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
             env.enableCheckpointing(500);
             createAction(
                             IcebergSyncAction.class,
-                            "iceberg_sync",
+                            "write_iceberg_metadata",
                             "--warehouse",
                             warehouse,
                             "--including_databases",
@@ -358,7 +377,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                 streamExecutionEnvironmentBuilder().streamingMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--including_databases",
@@ -407,7 +426,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                 streamExecutionEnvironmentBuilder().streamingMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--including_databases",
@@ -454,7 +473,7 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                 streamExecutionEnvironmentBuilder().streamingMode().build();
         createAction(
                         IcebergSyncAction.class,
-                        "iceberg_sync",
+                        "write_iceberg_metadata",
                         "--warehouse",
                         warehouse,
                         "--including_databases",

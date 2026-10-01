@@ -106,7 +106,7 @@ public final class IcebergSync implements AutoCloseable {
                                 .toString()
                                 .equalsIgnoreCase(storage.trim()),
                 "Table %s sets %s=%s; its writers already commit Iceberg metadata, so"
-                        + " iceberg_sync must not.",
+                        + " write_iceberg_metadata must not.",
                 original.fullName(),
                 IcebergOptions.METADATA_ICEBERG_STORAGE.key(),
                 storage);

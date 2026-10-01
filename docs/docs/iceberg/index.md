@@ -64,14 +64,14 @@ configuration and credentials.
 ## Mirror from a Separate Job
 
 By default every job that commits to a table also publishes the Iceberg metadata. To keep writers
-free of the mirror, leave the `metadata.iceberg.*` options off the table and run the `iceberg_sync`
+free of the mirror, leave the `metadata.iceberg.*` options off the table and run the `write_iceberg_metadata`
 action instead. It mirrors every snapshot since the last mirrored one, in order, so the Iceberg
 history follows the Paimon history.
 
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-@@VERSION@@.jar \
-    iceberg_sync \
+    write_iceberg_metadata \
     --warehouse <warehouse-path> \
     --including_databases <database-name|name-regular-expr> \
     [--including_tables <database.table|name-regular-expr>] \
@@ -99,7 +99,7 @@ mirrored, the action logs a warning and mirrors the latest snapshot from a scan 
 The same for one table from Flink SQL:
 
 ```sql
-CALL sys.iceberg_sync(
+CALL sys.write_iceberg_metadata(
     `table` => 'db.t',
     `options` => 'metadata.iceberg.storage=rest-catalog,metadata.iceberg.uri=http://localhost:8181');
 ```
@@ -108,6 +108,46 @@ The procedure returns the number of snapshots it mirrored. Arguments:
 
 - `table` (required): the target table identifier.
 - `options` (required): the `metadata.iceberg.*` options for the mirror, comma separated.
+
+### Behavior of the Action
+
+`--table_option_filter <key>=<value>` selects tables by their options; repeat it to accept any of
+several pairs. A table is mirrored only while its options match. A table that stops matching is
+forgotten, not dropped. A table that is turned off and then dropped keeps its Iceberg table; a person
+drops it.
+
+The Iceberg table is dropped only when the Paimon table is missing from the catalog listing on two
+consecutive polls, and only through a REST catalog. With other storages the action logs the drop and
+keeps the metadata. A catalog listing that fails drops nothing.
+
+`--poll_interval` must be at least 1 s.
+
+A failing table is held and retried after 30 s, after 2 min, and then every 10 min. The other tables
+go on. Holds and pending drops are in memory only, so a restart loses a pending drop. A person drops
+that Iceberg table.
+
+#### Metrics
+
+The metric group is `iceberg_metadata`. The per-table gauges carry the label `table="db.t"`. Their
+Prometheus names are `flink_taskmanager_job_task_operator_iceberg_metadata_table_<gauge>`.
+
+| Gauge | Reported by | Meaning |
+| --- | --- | --- |
+| `latest_snapshot_id` | source | The latest snapshot id of the Paimon table. |
+| `pending_snapshots` | source | The number of snapshots not yet mirrored. |
+| `mirrored_snapshot_id` | operator | The last mirrored snapshot id. It reads -1 after a restart until the next sync. |
+| `mirrored_snapshot_timestamp_ms` | operator | The commit time of the last mirrored snapshot. |
+| `on_hold` | operator | 1 while the table is held after a failure, else 0. |
+
+The counters have the Prometheus names `flink_taskmanager_job_task_operator_iceberg_metadata_<counter>`:
+`polls`, `failed_polls`, `snapshots_synced`, `sync_failures`, `mirrors_dropped` and
+`listener_failures`.
+
+#### Listeners
+
+The interface `IcebergSyncListener` reports mirrored snapshots and dropped mirrors. The job finds
+implementations through `ServiceLoader` with the user code class loader. A listener failure is logged
+and counted and never changes a sync. Calls run on the task thread.
 
 ## What Iceberg Readers See
 

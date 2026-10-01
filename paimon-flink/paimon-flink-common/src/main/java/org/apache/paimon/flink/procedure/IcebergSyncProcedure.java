@@ -35,12 +35,12 @@ import java.util.HashMap;
  * table itself stays without them.
  *
  * <pre><code>
- *  CALL sys.iceberg_sync(`table` => 'db.t', `options` => 'metadata.iceberg.storage=rest-catalog,metadata.iceberg.uri=http://...')
+ *  CALL sys.write_iceberg_metadata(`table` => 'db.t', `options` => 'metadata.iceberg.storage=rest-catalog,metadata.iceberg.uri=http://...')
  * </code></pre>
  */
 public class IcebergSyncProcedure extends ProcedureBase {
 
-    public static final String IDENTIFIER = "iceberg_sync";
+    public static final String IDENTIFIER = "write_iceberg_metadata";
 
     @Override
     public String identifier() {

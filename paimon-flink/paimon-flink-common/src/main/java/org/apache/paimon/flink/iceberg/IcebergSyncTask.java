@@ -28,7 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** One snapshot of one table for {@code iceberg_sync} to mirror. */
+/** One snapshot of one table for {@code write_iceberg_metadata} to mirror. */
 public class IcebergSyncTask implements Serializable {
 
     private static final long serialVersionUID = 1L;

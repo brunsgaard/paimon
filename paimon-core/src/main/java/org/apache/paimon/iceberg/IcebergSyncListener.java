@@ -23,7 +23,7 @@ import org.apache.paimon.catalog.Identifier;
 import java.util.Map;
 
 /**
- * Hears what the {@code iceberg_sync} job did. An implementation is found with {@link
+ * Hears what the {@code write_iceberg_metadata} job did. An implementation is found with {@link
  * java.util.ServiceLoader} through the user code class loader of the job, so it and its
  * dependencies can live outside the Paimon jars.
  *
