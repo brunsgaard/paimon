@@ -957,7 +957,8 @@ public class IcebergRestMetadataCommitterTest {
                                 org.apache.paimon.catalog.CatalogFactory.createCatalog(
                                         org.apache.paimon.catalog.CatalogContext.create(
                                                 catalogOptions)),
-                        jobOptions);
+                        jobOptions,
+                        new HashMap<>());
         operator.open((org.apache.flink.api.common.functions.OpenContext) null);
         operator.syncTask(
                 org.apache.paimon.flink.iceberg.IcebergSyncTask.drop("mydb", "t", naming));

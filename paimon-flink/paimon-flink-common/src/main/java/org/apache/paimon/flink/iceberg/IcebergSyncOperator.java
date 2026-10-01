@@ -142,10 +142,10 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
                     return;
                 }
                 listener = found.next();
-            } catch (ServiceConfigurationError | RuntimeException e) {
+            } catch (ServiceConfigurationError | RuntimeException | LinkageError e) {
                 listenerFailures.inc();
-                LOG.warn("A listener cannot be loaded and is not used.", e);
-                continue;
+                LOG.warn("A listener cannot be loaded; the remaining ones are not used.", e);
+                return;
             }
             try {
                 listener.open(new HashMap<>(configuration));
@@ -172,13 +172,23 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         }
     }
 
+    /** Tells the listeners about a mirrored snapshot. Nothing in here throws. */
     private void notifySynced(
             Identifier id, FileStoreTable table, long snapshotId, long timestampMs) {
-        Options options = Options.fromMap(table.options());
-        String icebergDatabase = IcebergOptions.icebergDatabaseName(options, id);
-        String icebergTable = IcebergOptions.icebergTableName(options, id);
-        notifyListeners(
-                l -> l.onSynced(id, snapshotId, timestampMs, icebergDatabase, icebergTable));
+        if (listeners.isEmpty()) {
+            return;
+        }
+        try {
+            Options options =
+                    Options.fromMap(IcebergSync.withMirrorDefaults(table, tableOptions).options());
+            String icebergDatabase = IcebergOptions.icebergDatabaseName(options, id);
+            String icebergTable = IcebergOptions.icebergTableName(options, id);
+            notifyListeners(
+                    l -> l.onSynced(id, snapshotId, timestampMs, icebergDatabase, icebergTable));
+        } catch (Exception | LinkageError e) {
+            listenerFailures.inc();
+            LOG.warn("Table {}: the listeners are not told about snapshot {}.", id, snapshotId, e);
+        }
     }
 
     /** Registers the gauges of a table once; a dropped table keeps its group and reads -1. */
@@ -238,11 +248,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             LOG.debug("Table {}: no metric for the retry.", fullName, e);
         }
         if (id >= 0) {
-            notifySynced(
-                    identifier,
-                    IcebergSync.withMirrorDefaults(table, tableOptions),
-                    id,
-                    timestampMs);
+            notifySynced(identifier, table, id, timestampMs);
         }
     }
 
@@ -402,7 +408,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             long timestampMs = recordMirrored(task.fullName(), table, task.snapshotId, 1);
             notifySynced(
                     Identifier.create(task.database, task.table),
-                    IcebergSync.withMirrorDefaults(table, tableOptions),
+                    table,
                     task.snapshotId,
                     timestampMs);
         }
@@ -477,10 +483,18 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             d.drop();
         }
         dropped.inc();
-        Identifier id = Identifier.create(task.database, task.table);
-        String icebergDatabase = IcebergOptions.icebergDatabaseName(options, id);
-        String icebergTable = IcebergOptions.icebergTableName(options, id);
-        notifyListeners(l -> l.onDropped(id, icebergDatabase, icebergTable));
+        if (listeners.isEmpty()) {
+            return;
+        }
+        try {
+            Identifier id = Identifier.create(task.database, task.table);
+            String icebergDatabase = IcebergOptions.icebergDatabaseName(options, id);
+            String icebergTable = IcebergOptions.icebergTableName(options, id);
+            notifyListeners(l -> l.onDropped(id, icebergDatabase, icebergTable));
+        } catch (Exception | LinkageError e) {
+            listenerFailures.inc();
+            LOG.warn("Table {}: the listeners are not told about the drop.", task.fullName(), e);
+        }
     }
 
     /** What to retry for a held table: the sync of its pending snapshots, or its drop. */

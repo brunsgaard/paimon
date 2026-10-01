@@ -30,6 +30,11 @@ import java.util.Map;
  * <p>The job calls a listener on the thread that mirrors the table. A call that throws is logged
  * and counted, and never changes the outcome of a sync. A listener that throws from {@link
  * #open(Map)} is not called again.
+ *
+ * <p>The configuration map is the client Flink configuration plus every mirror option, including
+ * any credential in them. The job builds it once when it builds the job graph; a change needs a new
+ * submission. A listener jar must not bundle Paimon classes: with child-first class loading the
+ * provider is then not a subtype of this interface, and the job skips it with a warning.
  */
 public interface IcebergSyncListener extends AutoCloseable {
 

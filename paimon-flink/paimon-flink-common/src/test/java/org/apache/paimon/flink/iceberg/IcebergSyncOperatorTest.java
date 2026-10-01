@@ -41,6 +41,7 @@ import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.operators.KeyedProcessOperator;
 import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -114,8 +115,20 @@ class IcebergSyncOperatorTest {
         harness.open();
     }
 
+    @BeforeEach
+    void resetListeners() {
+        RecordingListener.events.clear();
+        RecordingListener.configuration = null;
+        RecordingListener.recording = true;
+        ThrowingListener.calls.set(0);
+    }
+
     @AfterEach
     void tearDown() throws Exception {
+        RecordingListener.recording = false;
+        RecordingListener.events.clear();
+        RecordingListener.configuration = null;
+        ThrowingListener.calls.set(0);
         ThrowingListener.armed = false;
         ThrowingListener.linkageError = false;
         ThrowingListener.openFails = false;
@@ -252,6 +265,31 @@ class IcebergSyncOperatorTest {
         assertThat(ThrowingListener.calls.get()).isEqualTo(0);
         assertThat(listenerFailures(this)).isEqualTo(1L);
         assertThat(syncedEvents()).hasSize(1);
+    }
+
+    @Test
+    void testAProviderThatCannotBeLoadedDoesNotFailTheJob() throws Exception {
+        java.nio.file.Path services = tempDir.resolve("providers/META-INF/services");
+        java.nio.file.Files.createDirectories(services);
+        java.nio.file.Files.write(
+                services.resolve("org.apache.paimon.iceberg.IcebergSyncListener"),
+                "org.apache.paimon.flink.iceberg.NoSuchListener\n"
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        try (java.net.URLClassLoader loader =
+                new java.net.URLClassLoader(
+                        new java.net.URL[] {tempDir.resolve("providers").toUri().toURL()},
+                        original)) {
+            Thread.currentThread().setContextClassLoader(loader);
+            startHarness("table-location");
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
+        }
+        createTable("t");
+        harness.processElement(task("db", "t", 1), 0);
+        assertThat(IcebergSync.lastMirroredSnapshot(mirrored("t"))).isEqualTo(1L);
+        assertThat(listenerFailures(this)).isEqualTo(1L);
+        assertThat(syncedEvents()).containsExactly("synced db.t@1 -> db.t");
     }
 
     @Test

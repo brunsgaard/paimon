@@ -28,6 +28,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 /** Records what it hears. Registered through {@code META-INF/services}. */
 public class RecordingListener implements IcebergSyncListener {
 
+    /** While not set, the listener records nothing. */
+    static volatile boolean recording;
+
     static final List<String> events = new CopyOnWriteArrayList<>();
 
     /** The configuration of the last {@code open}. */
@@ -35,6 +38,9 @@ public class RecordingListener implements IcebergSyncListener {
 
     @Override
     public void open(Map<String, String> configuration) {
+        if (!recording) {
+            return;
+        }
         RecordingListener.configuration = configuration;
         events.add("open");
     }
@@ -46,6 +52,9 @@ public class RecordingListener implements IcebergSyncListener {
             long snapshotTimestampMs,
             String icebergDatabase,
             String icebergTable) {
+        if (!recording) {
+            return;
+        }
         events.add(
                 "synced "
                         + table.getFullName()
@@ -60,6 +69,9 @@ public class RecordingListener implements IcebergSyncListener {
 
     @Override
     public void onDropped(Identifier table, String icebergDatabase, String icebergTable) {
+        if (!recording) {
+            return;
+        }
         events.add(
                 "dropped " + table.getFullName() + " -> " + icebergDatabase + "." + icebergTable);
     }
