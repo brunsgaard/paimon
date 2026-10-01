@@ -890,6 +890,60 @@ public class IcebergRestMetadataCommitterTest {
         commit.close();
     }
 
+    private FileStoreTable createAndMirrorOnce() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.close();
+        commit.close();
+        return table;
+    }
+
+    @Test
+    public void testDropperDropsTheRestTableAndKeepsTheFiles() throws Exception {
+        FileStoreTable table = createAndMirrorOnce();
+        TableIdentifier id = TableIdentifier.of("mydb", "t");
+        assertThat(restCatalog.tableExists(id)).isTrue();
+        Path metadataDir = catalogTableMetadataPath(table);
+        IcebergMirrorDropper dropper =
+                new IcebergRESTMetadataCommitterFactory()
+                        .createDropper(
+                                Options.fromMap(table.options()), Identifier.create("mydb", "t"));
+        dropper.drop();
+        dropper.close();
+        assertThat(restCatalog.tableExists(id)).isFalse();
+        assertThat(table.fileIO().exists(metadataDir))
+                .as("purge is false; the files belong to the table")
+                .isTrue();
+    }
+
+    @Test
+    public void testDroppingAMissingIcebergTableIsANoOp() throws Exception {
+        FileStoreTable table = createAndMirrorOnce();
+        IcebergMirrorDropper dropper =
+                new IcebergRESTMetadataCommitterFactory()
+                        .createDropper(
+                                Options.fromMap(table.options()),
+                                Identifier.create("mydb", "absent"));
+        dropper.drop();
+        dropper.drop();
+        dropper.close();
+        assertThat(restCatalog.tableExists(TableIdentifier.of("mydb", "t"))).isTrue();
+    }
+
     @Test
     public void testIcebergSnapshotExpire() throws Exception {
         RowType rowType =

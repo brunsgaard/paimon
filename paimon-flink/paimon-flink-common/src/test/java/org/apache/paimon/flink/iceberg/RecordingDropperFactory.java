@@ -16,23 +16,35 @@
  * limitations under the License.
  */
 
-package org.apache.paimon.iceberg;
+package org.apache.paimon.flink.iceberg;
 
 import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.factories.Factory;
+import org.apache.paimon.iceberg.IcebergMetadataCommitter;
+import org.apache.paimon.iceberg.IcebergMetadataCommitterFactory;
+import org.apache.paimon.iceberg.IcebergMirrorDropper;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FileStoreTable;
 
-/** Factory to create {@link IcebergMetadataCommitter}. */
-public interface IcebergMetadataCommitterFactory extends Factory {
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
-    IcebergMetadataCommitter create(FileStoreTable table);
+/** Records the drops it is asked for. Registered with the identifier {@code recording}. */
+public class RecordingDropperFactory implements IcebergMetadataCommitterFactory {
 
-    /**
-     * A dropper for the Iceberg table that {@code table} would have under {@code options}, or null
-     * when this storage keeps no catalog entry. The table itself may be gone.
-     */
-    default IcebergMirrorDropper createDropper(Options options, Identifier table) {
-        return null;
+    static final List<String> drops = new CopyOnWriteArrayList<>();
+
+    @Override
+    public String identifier() {
+        return "recording";
+    }
+
+    @Override
+    public IcebergMetadataCommitter create(FileStoreTable table) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public IcebergMirrorDropper createDropper(Options options, Identifier table) {
+        return () -> drops.add(table.getFullName());
     }
 }

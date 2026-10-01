@@ -18,6 +18,8 @@
 
 package org.apache.paimon.iceberg;
 
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FileStoreTable;
 
 /** Factory to create {@link IcebergRestMetadataCommitter}. */
@@ -30,5 +32,10 @@ public class IcebergRESTMetadataCommitterFactory implements IcebergMetadataCommi
     @Override
     public IcebergMetadataCommitter create(FileStoreTable table) {
         return new IcebergRestMetadataCommitter(table);
+    }
+
+    @Override
+    public IcebergMirrorDropper createDropper(Options options, Identifier table) {
+        return new IcebergRestMetadataCommitter.Dropper(options, table);
     }
 }

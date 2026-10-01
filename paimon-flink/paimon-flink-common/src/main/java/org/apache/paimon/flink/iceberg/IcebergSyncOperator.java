@@ -22,7 +22,13 @@ import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.factories.FactoryException;
+import org.apache.paimon.factories.FactoryUtil;
+import org.apache.paimon.iceberg.IcebergMetadataCommitterFactory;
+import org.apache.paimon.iceberg.IcebergMirrorDropper;
+import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergSync;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FileStoreTable;
 
 import org.apache.flink.api.common.functions.OpenContext;
@@ -67,9 +73,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     @VisibleForTesting
     public void syncTask(IcebergSyncTask task) throws Exception {
         if (task.isDrop()) {
-            LOG.warn(
-                    "Ignoring the drop task of {}; dropping is not implemented yet.",
-                    task.fullName());
+            drop(task);
             return;
         }
         FileStoreTable table;
@@ -94,6 +98,41 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             syncs.put(task.fullName(), cached);
         }
         cached.sync.sync(task.snapshotId);
+    }
+
+    private void drop(IcebergSyncTask task) throws Exception {
+        Cached cached = syncs.remove(task.fullName());
+        if (cached != null) {
+            cached.sync.close();
+        }
+        Options options = Options.fromMap(tableOptions);
+        String storage = options.get(IcebergOptions.METADATA_ICEBERG_STORAGE.key());
+        IcebergMirrorDropper dropper = null;
+        if (storage != null) {
+            try {
+                dropper =
+                        FactoryUtil.discoverFactory(
+                                        IcebergSyncOperator.class.getClassLoader(),
+                                        IcebergMetadataCommitterFactory.class,
+                                        storage.trim())
+                                .createDropper(
+                                        options, Identifier.create(task.database, task.table));
+            } catch (FactoryException e) {
+                LOG.debug("No committer factory for storage {}.", storage, e);
+            }
+        }
+        if (dropper == null) {
+            LOG.warn(
+                    "Table {} is gone; storage {} keeps no catalog entry, its metadata stays.",
+                    task.fullName(),
+                    storage);
+            return;
+        }
+        try {
+            dropper.drop();
+        } finally {
+            dropper.close();
+        }
     }
 
     /** One sync per table, rebuilt when the table's schema (and with it its options) changes. */
