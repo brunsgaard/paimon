@@ -254,11 +254,21 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
             return tasks;
         }
 
-        /** Until Task 6: the tables one after the other. */
+        /** One snapshot per table per round, so a long backlog does not hold the others back. */
         List<IcebergSyncTask> interleave(List<List<IcebergSyncTask>> perTable) {
             List<IcebergSyncTask> out = new ArrayList<>();
-            perTable.forEach(out::addAll);
-            return out;
+            for (int round = 0; ; round++) {
+                boolean any = false;
+                for (List<IcebergSyncTask> pending : perTable) {
+                    if (round < pending.size()) {
+                        out.add(pending.get(round));
+                        any = true;
+                    }
+                }
+                if (!any) {
+                    return out;
+                }
+            }
         }
 
         private List<IcebergSyncTask> pendingTasks(Identifier id) throws Exception {

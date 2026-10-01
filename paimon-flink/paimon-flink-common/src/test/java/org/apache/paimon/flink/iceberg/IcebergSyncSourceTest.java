@@ -27,6 +27,7 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.iceberg.IcebergCommitCallback;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergSync;
 import org.apache.paimon.options.Options;
@@ -266,6 +267,32 @@ class IcebergSyncSourceTest {
         write("t");
         assertThat(names(reader.discover())).containsExactly("db.t@2", "db.t@3");
         assertThat(reader.discover()).isEmpty();
+    }
+
+    @Test
+    void testTablesAreInterleaved() throws Exception {
+        createTable("a", Collections.emptyMap());
+        createTable("b", Collections.emptyMap());
+        for (int i = 0; i < 3; i++) {
+            write("a");
+        }
+        for (int i = 0; i < 2; i++) {
+            write("b");
+        }
+        // a hint of 0 makes every snapshot from 1 pending; a first sync would take the latest only
+        for (String name : new String[] {"a", "b"}) {
+            FileStoreTable table = (FileStoreTable) catalog.getTable(Identifier.create("db", name));
+            Path hint =
+                    new Path(
+                            IcebergCommitCallback.catalogTableMetadataPath(
+                                    IcebergSync.withMirrorDefaults(table, mirrorOptions)),
+                            "version-hint.text");
+            table.fileIO().overwriteFileUtf8(hint, "0");
+        }
+        IcebergSyncSource.Reader reader =
+                reader(Pattern.compile("db\\..*"), Collections.emptyList());
+        assertThat(names(reader.discover()))
+                .containsExactly("db.a@1", "db.b@1", "db.a@2", "db.b@2", "db.a@3");
     }
 
     @Test
