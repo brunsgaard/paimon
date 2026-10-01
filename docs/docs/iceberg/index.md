@@ -83,9 +83,10 @@ order, so the Iceberg history follows the Paimon history.
     [--catalog_conf <key>=<value> ...]
 ```
 
-In batch mode the action syncs every matching table to its latest snapshot and exits. In streaming
-mode it rediscovers the tables and polls for new snapshots every `--poll_interval`, 10 seconds by
-default. The table patterns match the full `database.table` name, as they do for `compact_database`.
+In batch mode the action syncs every matching table to its latest snapshot and exits. The first
+table that fails, in the discovery or in its sync or drop, fails the batch job. In streaming mode it
+rediscovers the tables and polls for new snapshots every `--poll_interval`, 10 seconds by default.
+The table patterns match the full `database.table` name, as they do for `compact_database`.
 
 The mirror options come only from `--table_conf` and apply to a table copy inside the job. A table
 that sets `metadata.iceberg.storage` itself is refused, because its writers already publish the
@@ -126,8 +127,9 @@ databases go on.
 
 A table whose catalog or snapshot reads fail in the source is skipped for that poll and counted in
 `table_failures`. It is not dropped, and the next poll reads it again. A failing table is held and
-retried after 30 s, after 2 min, and then every 10 min. The other tables go on. Holds and pending drops are in memory only, so a restart loses a pending drop. A person drops
-that Iceberg table.
+retried after 30 s, after 2 min, and then every 10 min. The other tables go on. This applies to
+streaming mode; in batch mode the first failing table fails the job. Holds and pending drops are in
+memory only, so a restart loses a pending drop. A person drops that Iceberg table.
 
 #### Metrics
 

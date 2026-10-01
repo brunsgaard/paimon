@@ -54,6 +54,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class IcebergSyncOperatorTest {
 
@@ -77,13 +78,18 @@ class IcebergSyncOperatorTest {
     }
 
     private IcebergSyncOperator newOperator(String storage) {
+        return newOperator(storage, true);
+    }
+
+    private IcebergSyncOperator newOperator(String storage, boolean isStreaming) {
         Options catalogOptions = catalogOptions();
         mirrorOptions =
                 Collections.singletonMap(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), storage);
         return new IcebergSyncOperator(
                 () -> CatalogFactory.createCatalog(CatalogContext.create(catalogOptions)),
                 mirrorOptions,
-                new HashMap<>(Collections.singletonMap("job.key", "job.value")));
+                new HashMap<>(Collections.singletonMap("job.key", "job.value")),
+                isStreaming);
     }
 
     private IcebergSyncOperator operatorWithStorage(String storage) {
@@ -94,11 +100,15 @@ class IcebergSyncOperatorTest {
 
     /** A harness around an operator whose sync of table {@code bad} fails while failing. */
     private void startHarness(String storage) throws Exception {
+        startHarness(storage, true);
+    }
+
+    private void startHarness(String storage, boolean isStreaming) throws Exception {
         failing.set(true);
         syncsBuilt.set(0);
         catalog = CatalogFactory.createCatalog(CatalogContext.create(catalogOptions()));
         catalog.createDatabase("db", true);
-        operator = newOperator(storage);
+        operator = newOperator(storage, isStreaming);
         operator.syncFactory =
                 table -> {
                     syncsBuilt.incrementAndGet();
@@ -444,6 +454,26 @@ class IcebergSyncOperatorTest {
         assertThat(harness.numProcessingTimeTimers()).isEqualTo(1);
         harness.setProcessingTime(1_949_999);
         assertThat(operator.failures("db.bad")).as("ten minutes, not less").isEqualTo(5);
+    }
+
+    @Test
+    void testABatchSyncFailureFailsTheJob() throws Exception {
+        startHarness("table-location", false);
+        createTable("bad");
+        assertThatThrownBy(() -> harness.processElement(task("db", "bad", 1), 0))
+                .hasMessageContaining("The mirror cannot be written.");
+        assertThat(operator.failures("db.bad")).as("nothing is held").isEqualTo(0);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
+    }
+
+    @Test
+    void testABatchDropFailureFailsTheJob() throws Exception {
+        RecordingDropperFactory.failing.set(true);
+        startHarness("recording", false);
+        assertThatThrownBy(() -> harness.processElement(IcebergSyncTask.drop("db", "gone"), 0))
+                .isInstanceOf(Exception.class);
+        assertThat(operator.failures("db.gone")).as("nothing is held").isEqualTo(0);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
     }
 
     @Test

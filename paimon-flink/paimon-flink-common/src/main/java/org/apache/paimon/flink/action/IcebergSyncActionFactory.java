@@ -118,7 +118,8 @@ public class IcebergSyncActionFactory implements ActionFactory {
         System.out.println(
                 "--poll_interval is the time between two polls in streaming mode, default 10 s."
                         + " It must be at least 1 s. In batch mode every matching table is synced"
-                        + " to its latest snapshot and the job exits.");
+                        + " to its latest snapshot and the job exits; the first table that"
+                        + " fails, in the discovery or in its sync or drop, fails the job.");
         System.out.println();
 
         System.out.println("Drops:");
@@ -136,9 +137,10 @@ public class IcebergSyncActionFactory implements ActionFactory {
                 "  A table whose catalog or snapshot reads fail in the source is skipped for"
                         + " that poll and counted in table_failures; it is not dropped. A failing"
                         + " table is held and retried after 30 s, after 2 min, and then every"
-                        + " 10 min. The other tables go on. Holds and pending drops are in memory"
-                        + " only, so a restart loses a pending drop; a person drops that Iceberg"
-                        + " table.");
+                        + " 10 min. The other tables go on. This applies to streaming mode; in"
+                        + " batch mode the first failing table fails the job. Holds and pending"
+                        + " drops are in memory only, so a restart loses a pending drop; a person"
+                        + " drops that Iceberg table.");
         System.out.println();
 
         System.out.println("Metrics (group iceberg_metadata):");

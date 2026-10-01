@@ -135,7 +135,9 @@ public class IcebergSyncAction extends ActionBase {
                         new JavaTypeInfo<>(IcebergSyncTask.class))
                 .forceNonParallel()
                 .keyBy(IcebergSyncTask::fullName)
-                .process(new IcebergSyncOperator(catalogLoader(), tableOptions, configuration))
+                .process(
+                        new IcebergSyncOperator(
+                                catalogLoader(), tableOptions, configuration, isStreaming))
                 .name("write-iceberg-metadata")
                 .sinkTo(new DiscardingSink<>());
     }

@@ -57,13 +57,15 @@ import java.util.function.Consumer;
 /**
  * Mirrors the snapshots of the tasks it receives, with one {@link IcebergSync} per table.
  *
- * <p>A table whose sync or drop throws is put on hold, and the other tables go on. A keyed
- * processing-time timer retries it after {@link #RETRY_DELAYS_MILLIS}: a held sync runs {@link
- * IcebergSync#syncPending()}, which recomputes the pending snapshots from the hint, so the sync
- * tasks that arrive during the hold are ignored. A held drop is retried as a drop. A drop task
- * replaces a held sync, because the table is gone. A held sync of a table that is gone, and a held
- * drop of a table that exists again, release the hold. The holds are not checkpointed: after a
- * restart the source emits the pending snapshots again, but a held drop is lost.
+ * <p>In a streaming job, a table whose sync or drop throws is put on hold, and the other tables go
+ * on. In a batch job the failure fails the job, because a processing-time timer does not fire again
+ * in batch execution. A keyed processing-time timer retries a held table after {@link
+ * #RETRY_DELAYS_MILLIS}: a held sync runs {@link IcebergSync#syncPending()}, which recomputes the
+ * pending snapshots from the hint, so the sync tasks that arrive during the hold are ignored. A
+ * held drop is retried as a drop. A drop task replaces a held sync, because the table is gone. A
+ * held sync of a table that is gone, and a held drop of a table that exists again, release the
+ * hold. The holds are not checkpointed: after a restart the source emits the pending snapshots
+ * again, but a held drop is lost.
  *
  * <p>The {@link IcebergSyncListener}s found with {@link ServiceLoader} hear each mirrored snapshot
  * and each dropped mirror on the task thread. A listener call that fails is counted and never
@@ -78,6 +80,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     private final CatalogLoader catalogLoader;
     private final Map<String, String> tableOptions;
     private final HashMap<String, String> configuration;
+    private final boolean isStreaming;
 
     private transient Catalog catalog;
     private transient Map<String, Cached> syncs;
@@ -92,13 +95,27 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     private transient Map<String, Long> mirroredId;
     private transient Map<String, Long> mirroredTimestampMs;
 
+    /** An operator for a streaming job. */
     public IcebergSyncOperator(
             CatalogLoader catalogLoader,
             Map<String, String> tableOptions,
             HashMap<String, String> configuration) {
+        this(catalogLoader, tableOptions, configuration, true);
+    }
+
+    /**
+     * In a streaming job a failing table is held and retried. In a batch job the processing-time
+     * timers do not fire again, so a sync or a drop that fails fails the job.
+     */
+    public IcebergSyncOperator(
+            CatalogLoader catalogLoader,
+            Map<String, String> tableOptions,
+            HashMap<String, String> configuration,
+            boolean isStreaming) {
         this.catalogLoader = catalogLoader;
         this.tableOptions = new HashMap<>(tableOptions);
         this.configuration = new HashMap<>(configuration);
+        this.isStreaming = isStreaming;
     }
 
     @Override
@@ -277,6 +294,9 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             try {
                 drop(task);
             } catch (Exception e) {
+                if (!isStreaming) {
+                    throw e;
+                }
                 hold(task, 0, context.timerService(), e);
             }
             return;
@@ -292,6 +312,9 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             syncTask(task);
         } catch (Exception e) {
             evict(fullName);
+            if (!isStreaming) {
+                throw e;
+            }
             hold(task, 0, context.timerService(), e);
         }
     }
