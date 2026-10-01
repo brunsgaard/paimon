@@ -99,6 +99,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -532,6 +533,13 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                 snapshotReader.read().dataSplits().stream()
                         .filter(DataSplit::rawConvertible)
                         .collect(Collectors.toList());
+        // there is no base, so the check always runs
+        List<DataFileMeta> publishedFiles = new ArrayList<>();
+        for (DataSplit dataSplit : filteredDataSplits) {
+            publishedFiles.addAll(dataSplit.dataFiles());
+        }
+        checkPublishedFilesReadable(
+                publishedFiles, schemaCache, schemaCache.get(schemaCache.getLatestSchemaId()));
         for (DataSplit dataSplit : filteredDataSplits) {
             changedPartitions.add(dataSplit.partition());
             dataSplitToManifestEntries(
@@ -1109,6 +1117,14 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
         Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles = new LinkedHashMap<>();
         Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles = new LinkedHashMap<>();
         boolean isAddOnly = fileChangesCollector.collect(removedFiles, addedFiles);
+        // the check scans the snapshot, so it runs only when the current schema changes
+        if (schemaId != baseMetadata.currentSchemaId()) {
+            checkPublishedFilesReadable(
+                    filesPublishedOnBase(
+                            baseDataManifestFileMetas, removedFiles, addedFiles, snapshotId),
+                    schemaCache,
+                    icebergSchema);
+        }
         Set<BinaryRow> modifiedPartitionsSet =
                 removedFiles.values().stream()
                         .map(Pair::getLeft)
@@ -1317,6 +1333,14 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
             }
             String path = factories.get(entry.partition(), entry.bucket()).toPath(entry).toString();
             liveFiles.put(path, Pair.of(entry.partition(), entry.file()));
+        }
+        // the new metadata holds exactly the live files; check them only on a schema change
+        if (schemaId != baseMetadata.currentSchemaId()) {
+            List<DataFileMeta> publishedFiles = new ArrayList<>();
+            for (Pair<BinaryRow, DataFileMeta> live : liveFiles.values()) {
+                publishedFiles.add(live.getRight());
+            }
+            checkPublishedFilesReadable(publishedFiles, schemaCache, icebergSchema);
         }
 
         SummaryMetrics metrics = new SummaryMetrics();
@@ -1565,6 +1589,66 @@ public class IcebergCommitCallback implements CommitCallback, TagCallback {
                 Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles,
                 Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles)
                 throws IOException;
+    }
+
+    /**
+     * Throws when a published data file has a field whose type does not promote to the current
+     * schema. Paimon reads such a file with a cast; an Iceberg reader cannot. Nothing is written
+     * before this check, so the previous metadata stays.
+     */
+    private void checkPublishedFilesReadable(
+            Collection<DataFileMeta> publishedFiles,
+            SchemaCache schemaCache,
+            IcebergSchema current) {
+        Set<Long> fileSchemaIds = new TreeSet<>();
+        for (DataFileMeta file : publishedFiles) {
+            fileSchemaIds.add(file.schemaId());
+        }
+        String name = table.fullName();
+        for (long id : fileSchemaIds) {
+            if (id != current.schemaId()) {
+                IcebergSchemaPromotion.checkReadable(schemaCache.get(id), current, name);
+            }
+        }
+    }
+
+    /**
+     * The data files that the metadata built on a base holds: the live files of the base that this
+     * snapshot does not remove, and the files it adds. Iceberg manifests do not record the Paimon
+     * schema of a file, so the files of the base are found in a scan of the snapshot.
+     */
+    private List<DataFileMeta> filesPublishedOnBase(
+            List<IcebergManifestFileMeta> baseDataManifestFileMetas,
+            Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles,
+            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles,
+            long snapshotId) {
+        Set<String> basePaths = new HashSet<>();
+        for (IcebergManifestFileMeta meta : baseDataManifestFileMetas) {
+            for (IcebergManifestEntry entry :
+                    manifestFile.read(new Path(meta.manifestPath()).getName())) {
+                if (entry.isLive() && !removedFiles.containsKey(entry.file().filePath())) {
+                    basePaths.add(entry.file().filePath());
+                }
+            }
+        }
+        List<DataFileMeta> published = new ArrayList<>();
+        for (Pair<BinaryRow, DataFileMeta> added : addedFiles.values()) {
+            published.add(added.getRight());
+        }
+        DataFilePathFactories factories = new DataFilePathFactories(fileStorePathFactory);
+        for (ManifestEntry entry :
+                table.store()
+                        .newScan()
+                        .withKind(ScanMode.ALL)
+                        .withSnapshot(snapshotId)
+                        .plan()
+                        .files()) {
+            String path = factories.get(entry.partition(), entry.bucket()).toPath(entry).toString();
+            if (basePaths.contains(path) && !addedFiles.containsKey(path)) {
+                published.add(entry.file());
+            }
+        }
+        return published;
     }
 
     private boolean collectFileChanges(

@@ -973,6 +973,104 @@ public class IcebergCompatibilityTest {
     }
 
     @Test
+    public void testRefusedTypeChangeKeepsTheLastMetadata() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.STRING()},
+                        new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType, Collections.emptyList(), Collections.singletonList("k"), 1);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, BinaryString.fromString("10")));
+        commit.commit(1, write.prepareCommit(false, 1));
+        assertThat(getIcebergResult()).containsExactly("Record(1, 10)");
+
+        new FileSystemSchemaManager(table.fileIO(), table.location())
+                .commitChanges(SchemaChange.updateColumnType("v", DataTypes.INT()));
+        table = table.copyWithLatestSchema();
+        write.close();
+        commit.close();
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(2, 20));
+        TableWriteImpl<?> w = write;
+        TableCommitImpl c = commit;
+        assertThatThrownBy(() -> c.commit(2, w.prepareCommit(false, 2)))
+                .isInstanceOf(IcebergSchemaNotReadableException.class)
+                .hasMessage(
+                        "Table mydb.t has data files of schema 0 in which field v (id 1) is string; the current schema 1 makes it int, which Iceberg cannot read. A full compaction rewrites the files.");
+        assertThat(getIcebergResult()).containsExactly("Record(1, 10)");
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testRefusedTypeChangePublishesAfterFullCompaction() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.STRING()},
+                        new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType, Collections.emptyList(), Collections.singletonList("k"), 1);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, BinaryString.fromString("10")));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        new FileSystemSchemaManager(table.fileIO(), table.location())
+                .commitChanges(SchemaChange.updateColumnType("v", DataTypes.INT()));
+        table = table.copyWithLatestSchema();
+        write.close();
+        commit.close();
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(2, 20));
+        TableWriteImpl<?> w = write;
+        TableCommitImpl c = commit;
+        assertThatThrownBy(() -> c.commit(2, w.prepareCommit(false, 2)))
+                .isInstanceOf(IcebergSchemaNotReadableException.class);
+
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testPromotionOverOldFilesPublishes() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        // an append table publishes every file, so the old file stays next to the new one
+        FileStoreTable table =
+                createPaimonTable(rowType, Collections.emptyList(), Collections.emptyList(), -1);
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        new FileSystemSchemaManager(table.fileIO(), table.location())
+                .commitChanges(SchemaChange.updateColumnType("v", DataTypes.BIGINT()));
+        table = table.copyWithLatestSchema();
+        write.close();
+        commit.close();
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(2, 20L));
+        commit.commit(2, write.prepareCommit(false, 2));
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+        write.close();
+        commit.close();
+    }
+
+    @Test
     public void testIcebergSnapshotExpire() throws Exception {
         RowType rowType =
                 RowType.of(
