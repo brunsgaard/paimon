@@ -304,8 +304,12 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
                                                         "mirrored_snapshot_id",
                                                         table)));
                 assertThat(gauge(reporter, jobId, "on_hold", table)).isEqualTo(0);
-                assertThat((Long) gauge(reporter, jobId, "mirrored_snapshot_timestamp_ms", table))
-                        .isGreaterThan(0L);
+                waitUntil(
+                        () -> {
+                            Object ts =
+                                    gauge(reporter, jobId, "mirrored_snapshot_timestamp_ms", table);
+                            return ts != null && (Long) ts > 0L;
+                        });
                 waitUntil(
                         () ->
                                 Long.valueOf(2L)

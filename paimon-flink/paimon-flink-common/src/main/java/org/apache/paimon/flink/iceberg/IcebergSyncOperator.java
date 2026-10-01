@@ -125,9 +125,12 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         try {
             registerTable(fullName);
             synced.inc(count);
-            mirroredId.put(fullName, snapshotId);
-            mirroredTimestampMs.put(
-                    fullName, table.snapshotManager().snapshot(snapshotId).timeMillis());
+            try {
+                mirroredTimestampMs.put(
+                        fullName, table.snapshotManager().snapshot(snapshotId).timeMillis());
+            } finally {
+                mirroredId.put(fullName, snapshotId);
+            }
         } catch (Exception e) {
             LOG.debug("Table {}: no metric for snapshot {}.", fullName, snapshotId, e);
         }
@@ -137,12 +140,11 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
      * Records the snapshots a successful retry mirrored; the id is the one in the mirror's hint.
      */
     private void recordRetried(String fullName, FileStoreTable table, int count) {
+        synced.inc(count);
         try {
             long id = mirroredIdReader.apply(IcebergSync.withMirrorDefaults(table, tableOptions));
             if (id >= 0) {
-                recordMirrored(fullName, table, id, count);
-            } else {
-                synced.inc(count);
+                recordMirrored(fullName, table, id, 0);
             }
         } catch (Exception e) {
             LOG.debug("Table {}: no metric for the retry.", fullName, e);
