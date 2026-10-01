@@ -27,6 +27,7 @@ import org.apache.paimon.flink.source.SimpleSourceSplit;
 import org.apache.paimon.iceberg.IcebergSync;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.utils.SerializableFunction;
 
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.ReaderOutput;
@@ -106,6 +107,10 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
             SourceReaderContext context) {
         return newReader(context.metricGroup());
     }
+
+    /** For tests: how the latest snapshot id is read for the gauge when nothing is pending. */
+    SerializableFunction<FileStoreTable, Long> latestSnapshotReader =
+            table -> table.snapshotManager().latestSnapshotId();
 
     Reader newReader() {
         return newReader(null);
@@ -202,9 +207,20 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         }
 
         /** Sets the gauges of a table; the group stays when the table goes, and reads -1. */
-        private void report(String fullName, @Nullable Long latest, int pending) {
+        private void report(String fullName, FileStoreTable table, List<Long> pending) {
             if (metricGroup == null) {
                 return;
+            }
+            Long latest;
+            if (!pending.isEmpty()) {
+                latest = pending.get(pending.size() - 1);
+            } else {
+                try {
+                    latest = latestSnapshotReader.apply(table);
+                } catch (Exception e) {
+                    LOG.debug("Table {}: cannot read the latest snapshot id.", fullName, e);
+                    latest = latestSnapshotId.get(fullName);
+                }
             }
             tableGroups.computeIfAbsent(
                     fullName,
@@ -219,7 +235,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                         return group;
                     });
             latestSnapshotId.put(fullName, latest == null ? -1L : latest);
-            pendingSnapshots.put(fullName, (long) pending);
+            pendingSnapshots.put(fullName, (long) pending.size());
         }
 
         private void forget(String fullName) {
@@ -382,7 +398,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 LOG.warn("Table {}: skipped in this poll: {}", id.getFullName(), e.getMessage());
                 return Collections.emptyList();
             }
-            report(id.getFullName(), original.snapshotManager().latestSnapshotId(), pending.size());
+            report(id.getFullName(), original, pending);
             long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
             String uuid = original.uuid();
             String knownUuid = uuids.put(id.getFullName(), uuid);

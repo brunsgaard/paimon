@@ -38,6 +38,7 @@ import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.types.DataTypes;
 
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -179,6 +180,31 @@ class IcebergSyncSourceTest {
         }
         bad.fileIO().delete(hint, false);
         assertThat(names(reader.discover())).containsExactly("db.bad@1");
+    }
+
+    @Test
+    void testAFailedMetricReadDoesNotFailThePoll() throws Exception {
+        createTable("t", Collections.emptyMap());
+        write("t");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(Identifier.create("db", "t"));
+        new IcebergSync(IcebergSync.withMirrorDefaults(table, mirrorOptions)).sync(1);
+        IcebergSyncSource source =
+                new IcebergSyncSource(
+                        () -> catalog,
+                        Pattern.compile("db"),
+                        Pattern.compile("db\\..*"),
+                        null,
+                        Collections.emptyList(),
+                        mirrorOptions,
+                        true,
+                        Duration.ofSeconds(1));
+        source.latestSnapshotReader =
+                t -> {
+                    throw new java.io.UncheckedIOException(new java.io.IOException("read"));
+                };
+        IcebergSyncSource.Reader reader = source.newReader(new UnregisteredMetricsGroup());
+        reader.start();
+        assertThat(reader.discover()).as("nothing pending, and no failure").isEmpty();
     }
 
     @Test

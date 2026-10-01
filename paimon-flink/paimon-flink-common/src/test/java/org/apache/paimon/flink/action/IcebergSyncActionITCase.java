@@ -263,54 +263,72 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
         Configuration conf = reporter.addToConfiguration(new Configuration());
         conf.set(RestartStrategyOptions.RESTART_STRATEGY, "disable");
         conf.set(RestOptions.PORT, 0);
-        MiniCluster cluster =
+        try (MiniCluster cluster =
                 new MiniCluster(
                         new MiniClusterConfiguration.Builder()
                                 .setConfiguration(conf)
                                 .setNumTaskManagers(1)
                                 .setNumSlotsPerTaskManager(2)
-                                .build());
-        cluster.start();
-        StreamExecutionEnvironment env =
-                streamExecutionEnvironmentBuilder().streamingMode().parallelism(1).build();
-        env.enableCheckpointing(500);
-        createAction(
-                        IcebergSyncAction.class,
-                        "iceberg_sync",
-                        "--warehouse",
-                        warehouse,
-                        "--including_databases",
-                        database,
-                        "--including_tables",
-                        database + "\\.t1",
-                        "--table_conf",
-                        STORAGE_CONF,
-                        "--poll_interval",
-                        "1 s")
-                .withStreamExecutionEnvironment(env)
-                .build();
-        JobGraph jobGraph = env.getStreamGraph().getJobGraph();
-        JobID jobId = jobGraph.getJobID();
-        cluster.submitJob(jobGraph).get();
-        try {
-            waitUntil(() -> IcebergSync.lastMirroredSnapshot(mirror(t1)) == 2L);
-            String table = database + ".t1";
-            waitUntil(() -> metric(reporter, jobId, "mirrored_snapshot_id", table) != null);
-            assertThat(gauge(reporter, jobId, "mirrored_snapshot_id", table)).isEqualTo(2L);
-            assertThat(gauge(reporter, jobId, "on_hold", table)).isEqualTo(0);
-            assertThat((Long) gauge(reporter, jobId, "mirrored_snapshot_timestamp_ms", table))
-                    .isGreaterThan(0L);
-            waitUntil(() -> metric(reporter, jobId, "latest_snapshot_id", table) != null);
-            assertThat(gauge(reporter, jobId, "latest_snapshot_id", table)).isEqualTo(2L);
-            // the next poll sees the mirror up to date
-            waitUntil(
-                    () ->
-                            Long.valueOf(0L)
-                                    .equals(gauge(reporter, jobId, "pending_snapshots", table)));
-            assertThat(metric(reporter, jobId, "polls", null)).isNotNull();
-        } finally {
-            cluster.cancelJob(jobId).get();
-            cluster.close();
+                                .build())) {
+            cluster.start();
+            StreamExecutionEnvironment env =
+                    streamExecutionEnvironmentBuilder().streamingMode().parallelism(1).build();
+            env.enableCheckpointing(500);
+            createAction(
+                            IcebergSyncAction.class,
+                            "iceberg_sync",
+                            "--warehouse",
+                            warehouse,
+                            "--including_databases",
+                            database,
+                            "--including_tables",
+                            database + "\\.t1",
+                            "--table_conf",
+                            STORAGE_CONF,
+                            "--poll_interval",
+                            "1 s")
+                    .withStreamExecutionEnvironment(env)
+                    .build();
+            JobGraph jobGraph = env.getStreamGraph().getJobGraph();
+            JobID jobId = jobGraph.getJobID();
+            cluster.submitJob(jobGraph).get();
+            try {
+                String table = database + ".t1";
+                waitUntil(
+                        () ->
+                                Long.valueOf(2L)
+                                        .equals(
+                                                gauge(
+                                                        reporter,
+                                                        jobId,
+                                                        "mirrored_snapshot_id",
+                                                        table)));
+                assertThat(gauge(reporter, jobId, "on_hold", table)).isEqualTo(0);
+                assertThat((Long) gauge(reporter, jobId, "mirrored_snapshot_timestamp_ms", table))
+                        .isGreaterThan(0L);
+                waitUntil(
+                        () ->
+                                Long.valueOf(2L)
+                                        .equals(
+                                                gauge(
+                                                        reporter,
+                                                        jobId,
+                                                        "latest_snapshot_id",
+                                                        table)));
+                // the next poll sees the mirror up to date
+                waitUntil(
+                        () ->
+                                Long.valueOf(0L)
+                                        .equals(
+                                                gauge(
+                                                        reporter,
+                                                        jobId,
+                                                        "pending_snapshots",
+                                                        table)));
+                assertThat(metric(reporter, jobId, "polls", null)).isNotNull();
+            } finally {
+                cluster.cancelJob(jobId).get();
+            }
         }
     }
 
@@ -326,7 +344,8 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
     }
 
     private static Object gauge(InMemoryReporter reporter, JobID jobId, String name, String table) {
-        return ((Gauge<?>) metric(reporter, jobId, name, table)).getValue();
+        Metric metric = metric(reporter, jobId, name, table);
+        return metric == null ? null : ((Gauge<?>) metric).getValue();
     }
 
     @Test

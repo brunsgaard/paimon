@@ -217,6 +217,25 @@ class IcebergSyncOperatorTest {
     }
 
     @Test
+    void testARetryWhoseMetricReadFailsIsStillARecovery() throws Exception {
+        startHarness("table-location");
+        operator.mirroredIdReader =
+                table -> {
+                    throw new java.io.UncheckedIOException(new java.io.IOException("read"));
+                };
+        createTable("bad");
+        harness.processElement(task("db", "bad", 1), 0);
+        failing.set(false);
+        harness.setProcessingTime(30_000);
+        assertThat(IcebergSync.lastMirroredSnapshot(mirrored("bad"))).isEqualTo(1L);
+        assertThat(operator.failures("db.bad")).isEqualTo(0);
+        assertThat(tableGauge("db.bad", "on_hold")).isEqualTo(0);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "sync_failures").getCount())
+                .isEqualTo(1L);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
+    }
+
+    @Test
     void testADropIsCounted() throws Exception {
         RecordingDropperFactory.drops.clear();
         startHarness("recording");

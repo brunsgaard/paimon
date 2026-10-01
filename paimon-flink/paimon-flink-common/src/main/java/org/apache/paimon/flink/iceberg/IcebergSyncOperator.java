@@ -116,16 +116,36 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
                 });
     }
 
-    /** Records the mirrored snapshot of a table. The metrics never fail a sync. */
-    private void recordMirrored(String fullName, FileStoreTable table, long snapshotId) {
-        registerTable(fullName);
-        synced.inc();
-        mirroredId.put(fullName, snapshotId);
+    /** For tests: how the last mirrored snapshot id is read after a retry. */
+    SerializableFunction<FileStoreTable, Long> mirroredIdReader =
+            table -> IcebergSync.lastMirroredSnapshot(table);
+
+    /** Records the mirrored snapshot of a table. A metric never fails a sync. */
+    private void recordMirrored(String fullName, FileStoreTable table, long snapshotId, int count) {
         try {
+            registerTable(fullName);
+            synced.inc(count);
+            mirroredId.put(fullName, snapshotId);
             mirroredTimestampMs.put(
                     fullName, table.snapshotManager().snapshot(snapshotId).timeMillis());
         } catch (Exception e) {
-            LOG.debug("Table {}: no time for snapshot {}.", fullName, snapshotId, e);
+            LOG.debug("Table {}: no metric for snapshot {}.", fullName, snapshotId, e);
+        }
+    }
+
+    /**
+     * Records the snapshots a successful retry mirrored; the id is the one in the mirror's hint.
+     */
+    private void recordRetried(String fullName, FileStoreTable table, int count) {
+        try {
+            long id = mirroredIdReader.apply(IcebergSync.withMirrorDefaults(table, tableOptions));
+            if (id >= 0) {
+                recordMirrored(fullName, table, id, count);
+            } else {
+                synced.inc(count);
+            }
+        } catch (Exception e) {
+            LOG.debug("Table {}: no metric for the retry.", fullName, e);
         }
     }
 
@@ -206,11 +226,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         int mirrored = cached(task.fullName(), table).sync.syncPending();
         onHold.remove(task.fullName());
         if (mirrored > 0) {
-            Long head = table.snapshotManager().latestSnapshotId();
-            if (head != null) {
-                recordMirrored(task.fullName(), table, head);
-                synced.inc(mirrored - 1);
-            }
+            recordRetried(task.fullName(), table, mirrored);
         }
         LOG.info(
                 "Table {} recovered after {} failures; {} snapshots mirrored.",
@@ -246,8 +262,12 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         int failures = failuresBefore + 1;
         long delay = RETRY_DELAYS_MILLIS[Math.min(failures, RETRY_DELAYS_MILLIS.length) - 1];
         long retryAt = timers.currentProcessingTime() + delay;
-        registerTable(task.fullName());
-        failureCounter.inc();
+        try {
+            registerTable(task.fullName());
+            failureCounter.inc();
+        } catch (RuntimeException e) {
+            LOG.debug("Table {}: no metric for the failure.", task.fullName(), e);
+        }
         onHold.put(task.fullName(), new Hold(task, failures, retryAt));
         timers.registerProcessingTimeTimer(retryAt);
         LOG.warn(
@@ -282,7 +302,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             return;
         }
         if (cached(task.fullName(), table).sync.sync(task.snapshotId)) {
-            recordMirrored(task.fullName(), table, task.snapshotId);
+            recordMirrored(task.fullName(), table, task.snapshotId, 1);
         }
     }
 
