@@ -285,6 +285,28 @@ public class IcebergSyncTest {
     }
 
     @Test
+    public void testAHintThatStaysEmptyFailsAfterThreeReads() throws Exception {
+        write(stockTable, 1, GenericRow.of(1, 10));
+        try (IcebergSync sync = new IcebergSync(mirrorTable)) {
+            sync.syncPending();
+        }
+        Path hint =
+                new Path(
+                        IcebergCommitCallback.catalogTableMetadataPath(mirrorTable),
+                        "version-hint.text");
+        stockTable.fileIO().overwriteFileUtf8(hint, "");
+        long delay = IcebergSync.HINT_READ_DELAY_MILLIS;
+        IcebergSync.HINT_READ_DELAY_MILLIS = 0;
+        try {
+            assertThatThrownBy(() -> IcebergSync.lastMirroredSnapshot(mirrorTable))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("is empty after 3 reads");
+        } finally {
+            IcebergSync.HINT_READ_DELAY_MILLIS = delay;
+        }
+    }
+
+    @Test
     public void testMetadataWrittenBeforeACrashedHintIsRepairedOnTheNextSync() throws Exception {
         write(stockTable, 1, GenericRow.of(1, 10));
         write(stockTable, 2, GenericRow.of(2, 20));

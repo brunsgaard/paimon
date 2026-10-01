@@ -112,25 +112,45 @@ public final class IcebergSync implements AutoCloseable {
                 storage);
     }
 
+    static final int HINT_READS = 3;
+    static long HINT_READ_DELAY_MILLIS = 200;
+
     /** The snapshot id in {@code version-hint.text}, or -1 when the table has no mirror yet. */
     public static long lastMirroredSnapshot(FileStoreTable table) {
         Path hint =
                 new Path(
                         IcebergCommitCallback.catalogTableMetadataPath(table),
                         IcebergCommitCallback.VERSION_HINT_FILENAME);
-        String content;
-        try {
-            content = table.fileIO().readFileUtf8(hint);
-        } catch (FileNotFoundException e) {
-            return -1;
-        } catch (IOException e) {
-            throw new UncheckedIOException("Cannot read " + hint, e);
+        String content = "";
+        for (int attempt = 1; attempt <= HINT_READS; attempt++) {
+            try {
+                content = table.fileIO().readFileUtf8(hint).trim();
+            } catch (FileNotFoundException e) {
+                return -1;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot read " + hint, e);
+            }
+            if (!content.isEmpty()) {
+                break;
+            }
+            if (attempt < HINT_READS) {
+                // an overwrite in flight reads back empty; give the writer a moment
+                try {
+                    Thread.sleep(HINT_READ_DELAY_MILLIS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while reading " + hint, e);
+                }
+            }
+        }
+        if (content.isEmpty()) {
+            throw new IllegalStateException(hint + " is empty after " + HINT_READS + " reads.");
         }
         try {
-            return Long.parseLong(content.trim());
+            return Long.parseLong(content);
         } catch (NumberFormatException e) {
             throw new IllegalStateException(
-                    String.format("%s holds '%s', not a snapshot id.", hint, content.trim()), e);
+                    String.format("%s holds '%s', not a snapshot id.", hint, content), e);
         }
     }
 

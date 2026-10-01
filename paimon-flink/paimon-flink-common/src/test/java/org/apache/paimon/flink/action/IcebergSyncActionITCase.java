@@ -66,6 +66,19 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
     private static final String STORAGE_CONF = "metadata.iceberg.storage=table-location";
 
     @Test
+    public void testAPollIntervalUnderASecondIsRefused() {
+        IcebergSyncAction action =
+                new IcebergSyncAction(Collections.singletonMap("warehouse", warehouse));
+        assertThatThrownBy(() -> action.withPollInterval(java.time.Duration.ZERO))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--poll_interval must be at least 1 s");
+        assertThatThrownBy(() -> action.withPollInterval(java.time.Duration.ofMillis(999)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("--poll_interval must be at least 1 s");
+        action.withPollInterval(java.time.Duration.ofSeconds(1));
+    }
+
+    @Test
     public void testBatchSyncsEveryMatchingTable() throws Exception {
         FileStoreTable t1 = createTable("t1", Collections.emptyMap());
         FileStoreTable t2 = createTable("t2", Collections.emptyMap());

@@ -101,6 +101,10 @@ public class IcebergSyncAction extends ActionBase {
     }
 
     public IcebergSyncAction withPollInterval(Duration pollInterval) {
+        checkArgument(
+                pollInterval.compareTo(Duration.ofSeconds(1)) >= 0,
+                "--poll_interval must be at least 1 s, got %s.",
+                pollInterval);
         this.pollInterval = pollInterval;
         return this;
     }
