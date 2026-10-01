@@ -104,11 +104,15 @@ class IcebergSyncOperatorTest {
     }
 
     private void startHarness(String storage, boolean isStreaming) throws Exception {
+        startHarness(newOperator(storage, isStreaming));
+    }
+
+    private void startHarness(IcebergSyncOperator newOperator) throws Exception {
         failing.set(true);
         syncsBuilt.set(0);
         catalog = CatalogFactory.createCatalog(CatalogContext.create(catalogOptions()));
         catalog.createDatabase("db", true);
-        operator = newOperator(storage, isStreaming);
+        operator = newOperator;
         operator.syncFactory =
                 table -> {
                     syncsBuilt.incrementAndGet();
@@ -524,12 +528,6 @@ class IcebergSyncOperatorTest {
                 .as("the timer of the held sync is replaced")
                 .isEqualTo(1);
 
-        harness.processElement(task("db", "bad", 2), 11_000);
-        assertThat(operator.failures("db.bad"))
-                .as("a sync task behind a held drop is ignored")
-                .isEqualTo(1);
-        assertThat(harness.numProcessingTimeTimers()).isEqualTo(1);
-
         RecordingDropperFactory.failing.set(false);
         harness.setProcessingTime(30_000);
         assertThat(RecordingDropperFactory.drops).as("the old sync timer is gone").isEmpty();
@@ -537,6 +535,74 @@ class IcebergSyncOperatorTest {
         assertThat(RecordingDropperFactory.drops).containsExactly("db.bad");
         assertThat(operator.failures("db.bad")).isEqualTo(0);
         assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
+    }
+
+    /**
+     * An operator on the recording storage. It records the sync tasks it syncs, and their sync
+     * fails while {@link #failing} is set.
+     */
+    private IcebergSyncOperator recordingSyncs(List<String> synced) {
+        Options catalogOptions = catalogOptions();
+        mirrorOptions =
+                Collections.singletonMap(
+                        IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "recording");
+        return new IcebergSyncOperator(
+                () -> CatalogFactory.createCatalog(CatalogContext.create(catalogOptions)),
+                mirrorOptions,
+                new HashMap<>(),
+                true) {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public void syncTask(IcebergSyncTask task) throws Exception {
+                if (task.isDrop()) {
+                    super.syncTask(task);
+                    return;
+                }
+                if (failing.get()) {
+                    throw new IllegalStateException("The mirror cannot be written.");
+                }
+                synced.add(task.fullName() + "@" + task.snapshotId);
+            }
+        };
+    }
+
+    @Test
+    void testASyncTaskReleasesAHeldDropAndIsSynced() throws Exception {
+        RecordingDropperFactory.drops.clear();
+        RecordingDropperFactory.failing.set(true);
+        List<String> synced = new java.util.ArrayList<>();
+        startHarness(recordingSyncs(synced));
+        failing.set(false);
+        harness.processElement(IcebergSyncTask.drop("db", "back"), 0);
+        assertThat(operator.failures("db.back")).isEqualTo(1);
+        createTable("back");
+        harness.processElement(task("db", "back", 1), 1000);
+        assertThat(synced).containsExactly("db.back@1");
+        assertThat(operator.failures("db.back")).as("the drop is released").isEqualTo(0);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
+        RecordingDropperFactory.failing.set(false);
+        harness.setProcessingTime(30_000);
+        assertThat(RecordingDropperFactory.drops).isEmpty();
+    }
+
+    @Test
+    void testASyncTaskThatFailsBehindAHeldDropIsHeldAsASync() throws Exception {
+        RecordingDropperFactory.drops.clear();
+        RecordingDropperFactory.failing.set(true);
+        List<String> synced = new java.util.ArrayList<>();
+        startHarness(recordingSyncs(synced));
+        harness.processElement(IcebergSyncTask.drop("db", "back"), 0);
+        createTable("back");
+        harness.processElement(task("db", "back", 1), 1000);
+        assertThat(operator.failures("db.back")).as("a new hold, for the sync").isEqualTo(1);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(1);
+        RecordingDropperFactory.failing.set(false);
+        harness.setProcessingTime(31_000);
+        assertThat(RecordingDropperFactory.drops).as("nothing is dropped").isEmpty();
+        assertThat(operator.failures("db.back"))
+                .as("retried as a sync, not released as a drop")
+                .isEqualTo(2);
     }
 
     @Test

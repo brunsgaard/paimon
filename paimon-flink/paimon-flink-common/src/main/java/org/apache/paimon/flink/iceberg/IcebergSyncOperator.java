@@ -61,11 +61,12 @@ import java.util.function.Consumer;
  * on. In a batch job the failure fails the job, because a processing-time timer does not fire again
  * in batch execution. A keyed processing-time timer retries a held table after {@link
  * #RETRY_DELAYS_MILLIS}: a held sync runs {@link IcebergSync#syncPending()}, which recomputes the
- * pending snapshots from the hint, so the sync tasks that arrive during the hold are ignored. A
+ * pending snapshots from the hint, so the sync tasks that arrive during a held sync are ignored. A
  * held drop is retried as a drop. A drop task replaces a held sync, because the table is gone. A
- * held sync of a table that is gone, and a held drop of a table that exists again, release the
- * hold. The holds are not checkpointed: after a restart the source emits the pending snapshots
- * again, but a held drop is lost.
+ * sync task replaces a held drop, because the table exists again. A held sync of a table that is
+ * gone, and a held drop of a table that exists again, release the hold. The holds are not
+ * checkpointed: after a restart the source emits the pending snapshots again, but a held drop is
+ * lost.
  *
  * <p>The {@link IcebergSyncListener}s found with {@link ServiceLoader} hear each mirrored snapshot
  * and each dropped mirror on the task thread. A listener call that fails is counted and never
@@ -301,7 +302,15 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             }
             return;
         }
-        if (hold != null) {
+        if (hold != null && hold.task.isDrop()) {
+            // the source emits a snapshot of a dropped table only after it is created again
+            context.timerService().deleteProcessingTimeTimer(hold.retryAt);
+            onHold.remove(fullName);
+            LOG.warn(
+                    "Table {} exists again; its held drop is released and snapshot {} is synced.",
+                    fullName,
+                    task.snapshotId);
+        } else if (hold != null) {
             LOG.debug(
                     "Table {} is on hold; snapshot {} waits for the retry.",
                     fullName,
