@@ -41,9 +41,19 @@ import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.functions.OpenContext;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.RestOptions;
+import org.apache.flink.configuration.RestartStrategyOptions;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.metrics.Gauge;
+import org.apache.flink.metrics.Metric;
+import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.minicluster.MiniCluster;
+import org.apache.flink.runtime.minicluster.MiniClusterConfiguration;
+import org.apache.flink.runtime.testutils.InMemoryReporter;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.junit.jupiter.api.Test;
 
@@ -240,6 +250,83 @@ public class IcebergSyncActionITCase extends ActionITCaseBase {
         } finally {
             client.cancel().get();
         }
+    }
+
+    @Test
+    public void testStreamingReportsMetricsPerTable() throws Exception {
+        FileStoreTable t1 = createTable("t1", Collections.emptyMap());
+        writeOne(t1, 1, 10);
+        writeOne(t1, 2, 20);
+
+        // the shared mini cluster has no reporter, so the job runs on a mini cluster of its own
+        InMemoryReporter reporter = InMemoryReporter.createWithRetainedMetrics();
+        Configuration conf = reporter.addToConfiguration(new Configuration());
+        conf.set(RestartStrategyOptions.RESTART_STRATEGY, "disable");
+        conf.set(RestOptions.PORT, 0);
+        MiniCluster cluster =
+                new MiniCluster(
+                        new MiniClusterConfiguration.Builder()
+                                .setConfiguration(conf)
+                                .setNumTaskManagers(1)
+                                .setNumSlotsPerTaskManager(2)
+                                .build());
+        cluster.start();
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().parallelism(1).build();
+        env.enableCheckpointing(500);
+        createAction(
+                        IcebergSyncAction.class,
+                        "iceberg_sync",
+                        "--warehouse",
+                        warehouse,
+                        "--including_databases",
+                        database,
+                        "--including_tables",
+                        database + "\\.t1",
+                        "--table_conf",
+                        STORAGE_CONF,
+                        "--poll_interval",
+                        "1 s")
+                .withStreamExecutionEnvironment(env)
+                .build();
+        JobGraph jobGraph = env.getStreamGraph().getJobGraph();
+        JobID jobId = jobGraph.getJobID();
+        cluster.submitJob(jobGraph).get();
+        try {
+            waitUntil(() -> IcebergSync.lastMirroredSnapshot(mirror(t1)) == 2L);
+            String table = database + ".t1";
+            waitUntil(() -> metric(reporter, jobId, "mirrored_snapshot_id", table) != null);
+            assertThat(gauge(reporter, jobId, "mirrored_snapshot_id", table)).isEqualTo(2L);
+            assertThat(gauge(reporter, jobId, "on_hold", table)).isEqualTo(0);
+            assertThat((Long) gauge(reporter, jobId, "mirrored_snapshot_timestamp_ms", table))
+                    .isGreaterThan(0L);
+            waitUntil(() -> metric(reporter, jobId, "latest_snapshot_id", table) != null);
+            assertThat(gauge(reporter, jobId, "latest_snapshot_id", table)).isEqualTo(2L);
+            // the next poll sees the mirror up to date
+            waitUntil(
+                    () ->
+                            Long.valueOf(0L)
+                                    .equals(gauge(reporter, jobId, "pending_snapshots", table)));
+            assertThat(metric(reporter, jobId, "polls", null)).isNotNull();
+        } finally {
+            cluster.cancelJob(jobId).get();
+            cluster.close();
+        }
+    }
+
+    private static Metric metric(
+            InMemoryReporter reporter, JobID jobId, String name, String table) {
+        String suffix = table == null ? "iceberg_metadata." + name : table + "." + name;
+        return reporter.findMetrics(jobId, "iceberg_metadata").entrySet().stream()
+                .filter(e -> e.getKey().contains("iceberg_metadata"))
+                .filter(e -> e.getKey().endsWith(suffix))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static Object gauge(InMemoryReporter reporter, JobID jobId, String name, String table) {
+        return ((Gauge<?>) metric(reporter, jobId, name, table)).getValue();
     }
 
     @Test

@@ -33,6 +33,9 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.SerializableFunction;
 
 import org.apache.flink.api.common.functions.OpenContext;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.util.Collector;
@@ -42,6 +45,7 @@ import org.slf4j.LoggerFactory;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Mirrors the snapshots of the tasks it receives, with one {@link IcebergSync} per table.
@@ -66,6 +70,14 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     private transient Catalog catalog;
     private transient Map<String, Cached> syncs;
 
+    private transient MetricGroup metricGroup;
+    private transient Counter synced;
+    private transient Counter failureCounter;
+    private transient Counter dropped;
+    private transient Map<String, MetricGroup> tableGroups;
+    private transient Map<String, Long> mirroredId;
+    private transient Map<String, Long> mirroredTimestampMs;
+
     public IcebergSyncOperator(CatalogLoader catalogLoader, Map<String, String> tableOptions) {
         this.catalogLoader = catalogLoader;
         this.tableOptions = new HashMap<>(tableOptions);
@@ -75,7 +87,46 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
     public void open(OpenContext openContext) {
         catalog = catalogLoader.load();
         syncs = new HashMap<>();
-        onHold = new HashMap<>();
+        onHold = new ConcurrentHashMap<>();
+        tableGroups = new HashMap<>();
+        mirroredId = new ConcurrentHashMap<>();
+        mirroredTimestampMs = new ConcurrentHashMap<>();
+        try {
+            metricGroup = getRuntimeContext().getMetricGroup().addGroup("iceberg_metadata");
+        } catch (IllegalStateException e) {
+            metricGroup = new UnregisteredMetricsGroup();
+        }
+        synced = metricGroup.counter("snapshots_synced");
+        failureCounter = metricGroup.counter("sync_failures");
+        dropped = metricGroup.counter("mirrors_dropped");
+    }
+
+    /** Registers the gauges of a table once; a dropped table keeps its group and reads -1. */
+    private void registerTable(String fullName) {
+        tableGroups.computeIfAbsent(
+                fullName,
+                name -> {
+                    MetricGroup group = metricGroup.addGroup("table", name);
+                    group.gauge("mirrored_snapshot_id", () -> mirroredId.getOrDefault(name, -1L));
+                    group.gauge(
+                            "mirrored_snapshot_timestamp_ms",
+                            () -> mirroredTimestampMs.getOrDefault(name, -1L));
+                    group.gauge("on_hold", () -> onHold.containsKey(name) ? 1 : 0);
+                    return group;
+                });
+    }
+
+    /** Records the mirrored snapshot of a table. The metrics never fail a sync. */
+    private void recordMirrored(String fullName, FileStoreTable table, long snapshotId) {
+        registerTable(fullName);
+        synced.inc();
+        mirroredId.put(fullName, snapshotId);
+        try {
+            mirroredTimestampMs.put(
+                    fullName, table.snapshotManager().snapshot(snapshotId).timeMillis());
+        } catch (Exception e) {
+            LOG.debug("Table {}: no time for snapshot {}.", fullName, snapshotId, e);
+        }
     }
 
     /** The delays before the retries of a held table; the last one repeats. */
@@ -154,6 +205,13 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         }
         int mirrored = cached(task.fullName(), table).sync.syncPending();
         onHold.remove(task.fullName());
+        if (mirrored > 0) {
+            Long head = table.snapshotManager().latestSnapshotId();
+            if (head != null) {
+                recordMirrored(task.fullName(), table, head);
+                synced.inc(mirrored - 1);
+            }
+        }
         LOG.info(
                 "Table {} recovered after {} failures; {} snapshots mirrored.",
                 task.fullName(),
@@ -188,6 +246,8 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         int failures = failuresBefore + 1;
         long delay = RETRY_DELAYS_MILLIS[Math.min(failures, RETRY_DELAYS_MILLIS.length) - 1];
         long retryAt = timers.currentProcessingTime() + delay;
+        registerTable(task.fullName());
+        failureCounter.inc();
         onHold.put(task.fullName(), new Hold(task, failures, retryAt));
         timers.registerProcessingTimeTimer(retryAt);
         LOG.warn(
@@ -221,7 +281,9 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
                     task.snapshotId);
             return;
         }
-        cached(task.fullName(), table).sync.sync(task.snapshotId);
+        if (cached(task.fullName(), table).sync.sync(task.snapshotId)) {
+            recordMirrored(task.fullName(), table, task.snapshotId);
+        }
     }
 
     private Cached cached(String fullName, FileStoreTable table) throws Exception {
@@ -262,6 +324,8 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         if (cached != null) {
             cached.sync.close();
         }
+        mirroredId.remove(task.fullName());
+        mirroredTimestampMs.remove(task.fullName());
         Map<String, String> merged = new HashMap<>(task.mirrorNaming);
         merged.putAll(tableOptions);
         Options options = Options.fromMap(merged);
@@ -290,6 +354,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         try (IcebergMirrorDropper d = dropper) {
             d.drop();
         }
+        dropped.inc();
     }
 
     /** What to retry for a held table: the sync of its pending snapshots, or its drop. */

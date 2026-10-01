@@ -33,6 +33,8 @@ import org.apache.flink.api.connector.source.ReaderOutput;
 import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.core.io.InputStatus;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.MetricGroup;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,6 +51,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -101,11 +104,15 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
     @Override
     public SourceReader<IcebergSyncTask, SimpleSourceSplit> createReader(
             SourceReaderContext context) {
-        return newReader();
+        return newReader(context.metricGroup());
     }
 
     Reader newReader() {
-        return new Reader();
+        return newReader(null);
+    }
+
+    Reader newReader(@Nullable MetricGroup metricGroup) {
+        return new Reader(metricGroup);
     }
 
     /** Consecutive polls a table must be missing from the catalog before its mirror is dropped. */
@@ -175,6 +182,51 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         private transient Catalog catalog;
         private boolean passDone;
 
+        @Nullable private final MetricGroup metricGroup;
+        @Nullable private final Counter polls;
+        @Nullable private final Counter failedPolls;
+        private final Map<String, MetricGroup> tableGroups = new HashMap<>();
+        private final Map<String, Long> latestSnapshotId = new ConcurrentHashMap<>();
+        private final Map<String, Long> pendingSnapshots = new ConcurrentHashMap<>();
+
+        Reader(@Nullable MetricGroup context) {
+            if (context == null) {
+                metricGroup = null;
+                polls = null;
+                failedPolls = null;
+            } else {
+                metricGroup = context.addGroup("iceberg_metadata");
+                polls = metricGroup.counter("polls");
+                failedPolls = metricGroup.counter("failed_polls");
+            }
+        }
+
+        /** Sets the gauges of a table; the group stays when the table goes, and reads -1. */
+        private void report(String fullName, @Nullable Long latest, int pending) {
+            if (metricGroup == null) {
+                return;
+            }
+            tableGroups.computeIfAbsent(
+                    fullName,
+                    name -> {
+                        MetricGroup group = metricGroup.addGroup("table", name);
+                        group.gauge(
+                                "latest_snapshot_id",
+                                () -> latestSnapshotId.getOrDefault(name, -1L));
+                        group.gauge(
+                                "pending_snapshots",
+                                () -> pendingSnapshots.getOrDefault(name, -1L));
+                        return group;
+                    });
+            latestSnapshotId.put(fullName, latest == null ? -1L : latest);
+            pendingSnapshots.put(fullName, (long) pending);
+        }
+
+        private void forget(String fullName) {
+            latestSnapshotId.remove(fullName);
+            pendingSnapshots.remove(fullName);
+        }
+
         @Override
         public void start() {
             catalog = catalogLoader.load();
@@ -204,12 +256,18 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
          * no miss is counted, so a catalog outage never drops a mirror. In batch mode it fails.
          */
         List<IcebergSyncTask> discover() throws Exception {
+            if (polls != null) {
+                polls.inc();
+            }
             List<Identifier> matching;
             try {
                 matching =
                         matchingTables(
                                 catalog, databasePattern, includingPattern, excludingPattern);
             } catch (Exception e) {
+                if (failedPolls != null) {
+                    failedPolls.inc();
+                }
                 if (!isStreaming) {
                     throw e;
                 }
@@ -251,6 +309,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 lastEmitted.remove(gone);
                 uuids.remove(gone);
                 misses.remove(gone);
+                forget(gone);
             }
             return tasks;
         }
@@ -289,6 +348,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 uuids.remove(id.getFullName());
                 mirrorNamings.remove(id.getFullName());
                 misses.remove(id.getFullName());
+                forget(id.getFullName());
                 return Collections.emptyList();
             }
             FileStoreTable mirrored;
@@ -322,6 +382,7 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 LOG.warn("Table {}: skipped in this poll: {}", id.getFullName(), e.getMessage());
                 return Collections.emptyList();
             }
+            report(id.getFullName(), original.snapshotManager().latestSnapshotId(), pending.size());
             long from = lastEmitted.getOrDefault(id.getFullName(), -1L);
             String uuid = original.uuid();
             String knownUuid = uuids.put(id.getFullName(), uuid);

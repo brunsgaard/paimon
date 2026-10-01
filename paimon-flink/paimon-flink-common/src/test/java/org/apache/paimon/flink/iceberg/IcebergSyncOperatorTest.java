@@ -24,6 +24,7 @@ import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.flink.utils.TestingMetricUtils;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.iceberg.IcebergSync;
@@ -36,6 +37,7 @@ import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.types.DataTypes;
 
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.operators.KeyedProcessOperator;
 import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
 import org.junit.jupiter.api.AfterEach;
@@ -176,6 +178,51 @@ class IcebergSyncOperatorTest {
         assertThat(IcebergSync.lastMirroredSnapshot(mirrored("good"))).isEqualTo(1L);
         assertThat(IcebergSync.lastMirroredSnapshot(mirrored("bad"))).isEqualTo(-1L);
         assertThat(harness.numProcessingTimeTimers()).isEqualTo(1);
+    }
+
+    private MetricGroup metrics() {
+        return harness.getOneInputOperator().getMetricGroup().addGroup("iceberg_metadata");
+    }
+
+    private Object tableGauge(String table, String name) {
+        return TestingMetricUtils.getGauge(metrics().addGroup("table", table), name).getValue();
+    }
+
+    @Test
+    void testTheMetricsFollowASyncAndAHold() throws Exception {
+        startHarness("table-location");
+        createTable("bad");
+        createTable("good");
+        harness.processElement(task("db", "good", 1), 0);
+        assertThat(tableGauge("db.good", "mirrored_snapshot_id")).isEqualTo(1L);
+        assertThat((Long) tableGauge("db.good", "mirrored_snapshot_timestamp_ms")).isPositive();
+        assertThat(tableGauge("db.good", "on_hold")).isEqualTo(0);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "snapshots_synced").getCount())
+                .isEqualTo(1L);
+
+        harness.processElement(task("db", "bad", 1), 0);
+        assertThat(tableGauge("db.bad", "on_hold")).isEqualTo(1);
+        assertThat(tableGauge("db.bad", "mirrored_snapshot_id")).isEqualTo(-1L);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "sync_failures").getCount())
+                .isEqualTo(1L);
+
+        failing.set(false);
+        harness.setProcessingTime(30_000);
+        assertThat(tableGauge("db.bad", "on_hold")).isEqualTo(0);
+        assertThat(tableGauge("db.bad", "mirrored_snapshot_id")).isEqualTo(1L);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "snapshots_synced").getCount())
+                .isEqualTo(2L);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "sync_failures").getCount())
+                .isEqualTo(1L);
+    }
+
+    @Test
+    void testADropIsCounted() throws Exception {
+        RecordingDropperFactory.drops.clear();
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "mirrors_dropped").getCount())
+                .isEqualTo(1L);
     }
 
     @Test
