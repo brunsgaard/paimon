@@ -125,7 +125,10 @@ public class IcebergSyncActionFactory implements ActionFactory {
         System.out.println(
                 "  The Iceberg table is dropped only when the Paimon table is missing from the"
                         + " catalog listing on two consecutive polls, and only through a REST"
-                        + " catalog. Other storages log and keep the metadata.");
+                        + " catalog. Other storages log and keep the metadata. A failed catalog"
+                        + " listing drops nothing. A database whose table listing fails is skipped"
+                        + " for that poll and counted in failed_polls; its tables are not dropped,"
+                        + " and the other databases go on.");
         System.out.println();
 
         System.out.println("Failures:");

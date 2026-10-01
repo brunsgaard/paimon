@@ -118,7 +118,9 @@ drops it.
 
 The Iceberg table is dropped only when the Paimon table is missing from the catalog listing on two
 consecutive polls, and only through a REST catalog. With other storages the action logs the drop and
-keeps the metadata. A catalog listing that fails drops nothing.
+keeps the metadata. A catalog listing that fails drops nothing. A database whose table listing fails
+is skipped for that poll and counted in `failed_polls`; its tables are not dropped, and the other
+databases go on.
 
 `--poll_interval` must be at least 1 s.
 

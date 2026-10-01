@@ -149,19 +149,39 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
         return false;
     }
 
-    /** The tables whose full name matches the including pattern and not the excluding one. */
+    /**
+     * The tables whose full name matches the including pattern and not the excluding one. When
+     * {@code unlisted} is not null, a database whose listing fails is added to it and skipped;
+     * otherwise the failure is thrown.
+     */
     static List<Identifier> matchingTables(
             Catalog catalog,
             Pattern databasePattern,
             Pattern includingPattern,
-            @Nullable Pattern excludingPattern)
-            throws Catalog.DatabaseNotExistException {
+            @Nullable Pattern excludingPattern,
+            @Nullable Set<String> unlisted)
+            throws Exception {
         List<Identifier> matching = new ArrayList<>();
         for (String database : catalog.listDatabases()) {
             if (!databasePattern.matcher(database).matches()) {
                 continue;
             }
-            for (String table : catalog.listTables(database)) {
+            List<String> tables;
+            try {
+                tables = catalog.listTables(database);
+            } catch (Exception e) {
+                if (unlisted == null) {
+                    throw e;
+                }
+                LOG.warn(
+                        "Listing database {} failed; its tables are skipped in this poll: {}",
+                        database,
+                        e.toString());
+                LOG.debug("Database {}: the listing failure.", database, e);
+                unlisted.add(database);
+                continue;
+            }
+            for (String table : tables) {
                 String fullName = database + "." + table;
                 if (includingPattern.matcher(fullName).matches()
                         && (excludingPattern == null
@@ -271,17 +291,24 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
 
         /**
          * One poll. A failed listing in streaming mode is one skipped poll: nothing is emitted and
-         * no miss is counted, so a catalog outage never drops a mirror. In batch mode it fails.
+         * no miss is counted, so a catalog outage never drops a mirror. A database whose listing
+         * fails is skipped in the same way, and the other databases go on. In batch mode a failed
+         * listing fails.
          */
         List<IcebergSyncTask> discover() throws Exception {
             if (polls != null) {
                 polls.inc();
             }
             List<Identifier> matching;
+            Set<String> unlisted = new HashSet<>();
             try {
                 matching =
                         matchingTables(
-                                catalog, databasePattern, includingPattern, excludingPattern);
+                                catalog,
+                                databasePattern,
+                                includingPattern,
+                                excludingPattern,
+                                isStreaming ? unlisted : null);
             } catch (Exception e) {
                 if (failedPolls != null) {
                     failedPolls.inc();
@@ -291,6 +318,9 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 }
                 LOG.warn("Listing the catalog failed; this poll is skipped.", e);
                 return Collections.emptyList();
+            }
+            if (failedPolls != null) {
+                failedPolls.inc(unlisted.size());
             }
             Set<String> present = new HashSet<>();
             List<List<IcebergSyncTask>> perTable = new ArrayList<>();
@@ -307,6 +337,11 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                 if (present.contains(gone)) {
                     continue;
                 }
+                Identifier id = Identifier.fromString(gone);
+                if (unlisted.contains(id.getDatabaseName())) {
+                    // a failed listing is no miss
+                    continue;
+                }
                 int n = misses.merge(gone, 1, Integer::sum);
                 if (n < MISSES_BEFORE_DROP) {
                     LOG.info(
@@ -316,7 +351,6 @@ public class IcebergSyncSource extends AbstractNonCoordinatedSource<IcebergSyncT
                             MISSES_BEFORE_DROP);
                     continue;
                 }
-                Identifier id = Identifier.fromString(gone);
                 LOG.warn("Table {} is gone from the catalog; its mirror will be dropped.", gone);
                 tasks.add(
                         IcebergSyncTask.drop(

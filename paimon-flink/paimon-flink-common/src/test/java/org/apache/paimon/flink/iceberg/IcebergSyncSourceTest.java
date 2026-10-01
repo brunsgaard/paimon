@@ -449,6 +449,46 @@ class IcebergSyncSourceTest {
         assertThatThrownBy(reader::discover).hasMessageContaining("latest snapshot id");
     }
 
+    @Test
+    void testADatabaseWhoseListingFailsIsSkippedAndDropsNothing() throws Exception {
+        catalog.createDatabase("db2", false);
+        createTable("t", Collections.emptyMap());
+        write("t");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("v", DataTypes.STRING())
+                        .build();
+        catalog.createTable(Identifier.create("db2", "u"), schema, false);
+        FileStoreTable u = (FileStoreTable) catalog.getTable(Identifier.create("db2", "u"));
+        BatchWriteBuilder builder = u.newBatchWriteBuilder();
+        try (BatchTableWrite write = builder.newWrite();
+                BatchTableCommit commit = builder.newCommit()) {
+            write.write(GenericRow.of(1, BinaryString.fromString("r")));
+            commit.commit(write.prepareCommit());
+        }
+        FailingListCatalog failing = new FailingListCatalog(catalog);
+        RecordingMetricGroup metrics = new RecordingMetricGroup();
+        IcebergSyncSource.Reader reader = reader(failing, true, metrics);
+        assertThat(names(reader.discover())).containsExactlyInAnyOrder("db.t@1", "db2.u@1");
+        write("t");
+        failing.failListing.add("db2");
+        assertThat(names(reader.discover())).containsExactly("db.t@2");
+        assertThat(reader.discover()).as("a second failed listing drops nothing").isEmpty();
+        assertThat(counter(metrics, "failed_polls")).isEqualTo(2L);
+        failing.failListing.clear();
+        assertThat(reader.discover()).as("still there, no drop, nothing new").isEmpty();
+    }
+
+    @Test
+    void testABatchDatabaseListingFailureFails() throws Exception {
+        createTable("t", Collections.emptyMap());
+        FailingListCatalog failing = new FailingListCatalog(catalog);
+        failing.failListing.add("db");
+        IcebergSyncSource.Reader reader = reader(failing, false, null);
+        assertThatThrownBy(reader::discover).hasMessageContaining("listing of db failed");
+    }
+
     /**
      * Forwards to a catalog. It fails listDatabases, the listing of a database, getTable of a
      * table, or the snapshot reads of a table on demand.
