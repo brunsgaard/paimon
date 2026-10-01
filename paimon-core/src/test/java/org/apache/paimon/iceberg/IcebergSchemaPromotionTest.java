@@ -152,4 +152,68 @@ class IcebergSchemaPromotionTest {
                 .extracting("field")
                 .isEqualTo("m");
     }
+
+    @Test
+    public void testNestedRefusalMessageRendersTypes() {
+        IcebergSchema file = schema(0, new DataField(3, "l", DataTypes.ARRAY(DataTypes.STRING())));
+        IcebergSchema current = schema(1, new DataField(3, "l", DataTypes.ARRAY(DataTypes.INT())));
+        assertThatThrownBy(() -> IcebergSchemaPromotion.checkReadable(file, current, "db.t"))
+                .isInstanceOf(IcebergSchemaNotReadableException.class)
+                .hasMessage(
+                        "Table db.t has data files of schema 0 in which field l (id 3) is list<string>; the current schema 1 makes it list<int>, which Iceberg cannot read. A full compaction rewrites the files.");
+        IcebergSchema structFile =
+                schema(
+                        0,
+                        new DataField(
+                                4,
+                                "m",
+                                DataTypes.MAP(
+                                        DataTypes.STRING(),
+                                        DataTypes.ROW(
+                                                new DataField(5, "a", DataTypes.INT()),
+                                                new DataField(6, "b", DataTypes.STRING())))));
+        IcebergSchema structCurrent =
+                schema(
+                        1,
+                        new DataField(4, "m", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT())));
+        assertThatThrownBy(
+                        () ->
+                                IcebergSchemaPromotion.checkReadable(
+                                        structFile, structCurrent, "db.t"))
+                .hasMessageContaining("is map<string, struct<a: int, b: string>>;")
+                .hasMessageContaining("makes it map<string, int>,");
+    }
+
+    @Test
+    public void testListElementChangedToStructIsRefused() {
+        IcebergSchema file = schema(0, new DataField(3, "l", DataTypes.ARRAY(DataTypes.INT())));
+        IcebergSchema current =
+                schema(
+                        1,
+                        new DataField(
+                                3,
+                                "l",
+                                DataTypes.ARRAY(
+                                        DataTypes.ROW(new DataField(7, "a", DataTypes.INT())))));
+        assertThatThrownBy(() -> IcebergSchemaPromotion.checkReadable(file, current, "db.t"))
+                .isInstanceOf(IcebergSchemaNotReadableException.class)
+                .extracting("field")
+                .isEqualTo("l");
+    }
+
+    @Test
+    public void testMapWithMismatchedKeyIdIsRefused() {
+        IcebergSchema file =
+                schema(
+                        0,
+                        new DataField(4, "m", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT())));
+        IcebergSchema current =
+                schema(
+                        1,
+                        new DataField(9, "m", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT())));
+        // Same top-level id is needed for the comparison, so compare the types directly.
+        Object from = file.fields().get(0).type();
+        Object to = current.fields().get(0).type();
+        assertThat(IcebergSchemaPromotion.promotes(from, to)).isFalse();
+    }
 }

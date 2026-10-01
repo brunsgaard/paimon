@@ -92,6 +92,29 @@ public final class IcebergSchemaPromotion {
         return true;
     }
 
+    private static String render(Object type) {
+        if (type instanceof IcebergListType) {
+            return "list<" + render(((IcebergListType) type).element()) + ">";
+        }
+        if (type instanceof IcebergMapType) {
+            IcebergMapType map = (IcebergMapType) type;
+            return "map<" + render(map.key()) + ", " + render(map.value()) + ">";
+        }
+        if (type instanceof IcebergStructType) {
+            StringBuilder builder = new StringBuilder("struct<");
+            boolean first = true;
+            for (IcebergDataField field : ((IcebergStructType) type).fields()) {
+                if (!first) {
+                    builder.append(", ");
+                }
+                first = false;
+                builder.append(field.name()).append(": ").append(render(field.type()));
+            }
+            return builder.append(">").toString();
+        }
+        return String.valueOf(type);
+    }
+
     private static Map<Integer, IcebergDataField> byId(List<IcebergDataField> fields) {
         Map<Integer, IcebergDataField> result = new HashMap<>();
         for (IcebergDataField field : fields) {
@@ -119,9 +142,9 @@ public final class IcebergSchemaPromotion {
                             fileSchema.schemaId(),
                             field.name(),
                             field.id(),
-                            field.type(),
+                            render(field.type()),
                             current.schemaId(),
-                            now.type()),
+                            render(now.type())),
                     table,
                     field.name(),
                     fileSchema.schemaId());
