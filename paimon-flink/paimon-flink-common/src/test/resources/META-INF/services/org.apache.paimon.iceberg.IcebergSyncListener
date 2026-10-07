@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Catalog lock factory
-org.apache.paimon.flink.FileSystemCatalogITCase$FileSystemCatalogDummyLockFactory
 
-org.apache.paimon.flink.sink.listener.CustomCommitListenerTest$TestPartitionCollector$Factory
-
-org.apache.paimon.flink.iceberg.RecordingDropperFactory
+org.apache.paimon.flink.iceberg.RecordingListener
+org.apache.paimon.flink.iceberg.ThrowingListener
