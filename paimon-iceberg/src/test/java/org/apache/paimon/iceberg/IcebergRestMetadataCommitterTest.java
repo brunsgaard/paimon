@@ -57,6 +57,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.exceptions.ForbiddenException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -888,6 +890,106 @@ public class IcebergRestMetadataCommitterTest {
 
         write.close();
         commit.close();
+    }
+
+    private FileStoreTable createAndMirrorOnce() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.close();
+        commit.close();
+        return table;
+    }
+
+    @Test
+    public void testDropperDropsTheRestTableAndKeepsTheFiles() throws Exception {
+        FileStoreTable table = createAndMirrorOnce();
+        TableIdentifier id = TableIdentifier.of("mydb", "t");
+        assertThat(restCatalog.tableExists(id)).isTrue();
+        Path metadataDir = catalogTableMetadataPath(table);
+        IcebergMirrorDropper dropper =
+                new IcebergRESTMetadataCommitterFactory()
+                        .createDropper(
+                                Options.fromMap(table.options()), Identifier.create("mydb", "t"));
+        dropper.drop();
+        dropper.close();
+        assertThat(restCatalog.tableExists(id)).isFalse();
+        assertThat(table.fileIO().exists(metadataDir))
+                .as("purge is false; the files belong to the table")
+                .isTrue();
+    }
+
+    @Test
+    public void testDroppingAMissingIcebergTableIsANoOp() throws Exception {
+        FileStoreTable table = createAndMirrorOnce();
+        IcebergMirrorDropper dropper =
+                new IcebergRESTMetadataCommitterFactory()
+                        .createDropper(
+                                Options.fromMap(table.options()),
+                                Identifier.create("mydb", "absent"));
+        dropper.drop();
+        dropper.drop();
+        dropper.close();
+        assertThat(restCatalog.tableExists(TableIdentifier.of("mydb", "t"))).isTrue();
+    }
+
+    @Test
+    public void testTheDropperTellsWhetherTheTableExists() throws Exception {
+        FileStoreTable table = createAndMirrorOnce();
+        Options options = Options.fromMap(table.options());
+        IcebergRESTMetadataCommitterFactory factory = new IcebergRESTMetadataCommitterFactory();
+        try (IcebergMirrorDropper present =
+                        factory.createDropper(options, Identifier.create("mydb", "t"));
+                IcebergMirrorDropper absent =
+                        factory.createDropper(options, Identifier.create("mydb", "absent"));
+                IcebergMirrorDropper noNamespace =
+                        factory.createDropper(options, Identifier.create("nodb", "t"))) {
+            assertThat(present.exists()).isTrue();
+            assertThat(absent.exists()).isFalse();
+            assertThat(noNamespace.exists()).isFalse();
+        }
+    }
+
+    @Test
+    public void testARefusedCheckFindsAGoneNamespace() throws Exception {
+        TableIdentifier id = TableIdentifier.of("scratch", "t");
+        IcebergMirrorDropper gone =
+                new IcebergRestMetadataCommitter.Dropper(refusingCatalog(false), id);
+        IcebergMirrorDropper unknown =
+                new IcebergRestMetadataCommitter.Dropper(refusingCatalog(true), id);
+        assertThat(gone.exists()).isFalse();
+        assertThatThrownBy(unknown::exists).isInstanceOf(ForbiddenException.class);
+    }
+
+    /** Refuses each existence check of a table, as a server that checks the access first. */
+    private static RESTCatalog refusingCatalog(boolean namespaceExists) {
+        return new RESTCatalog() {
+            @Override
+            public boolean tableExists(TableIdentifier identifier) {
+                throw new ForbiddenException("not authorized to perform operation 'loadTable'");
+            }
+
+            @Override
+            public List<TableIdentifier> listTables(Namespace namespace) {
+                if (!namespaceExists) {
+                    throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+                }
+                return Collections.emptyList();
+            }
+        };
     }
 
     @Test

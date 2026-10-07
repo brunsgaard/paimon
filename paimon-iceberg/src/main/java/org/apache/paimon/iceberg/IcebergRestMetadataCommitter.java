@@ -49,6 +49,9 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.ForbiddenException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.rest.Endpoint;
 import org.apache.iceberg.rest.RESTCatalog;
@@ -129,30 +132,87 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         tableLocation = table.location().toString();
 
         Identifier identifier = Preconditions.checkNotNull(table.catalogEnvironment().identifier());
-        String icebergDatabase = options.get(IcebergOptions.METASTORE_DATABASE);
-        String icebergTable = options.get(IcebergOptions.METASTORE_TABLE);
-        this.icebergDatabaseName =
-                icebergDatabase != null && !icebergDatabase.isEmpty()
-                        ? icebergDatabase
-                        : identifier.getDatabaseName();
-        String icebergTableName =
-                icebergTable != null && !icebergTable.isEmpty()
-                        ? icebergTable
-                        : identifier.getTableName();
-        this.icebergTableIdentifier =
-                TableIdentifier.of(Namespace.of(icebergDatabaseName), icebergTableName);
-
-        Map<String, String> restConfigs = icebergOptions.icebergRestConfig();
+        this.icebergTableIdentifier = icebergIdentifier(options, identifier);
+        this.icebergDatabaseName = icebergTableIdentifier.namespace().level(0);
 
         try {
-            Configuration hadoopConf = new Configuration();
-            hadoopConf.setClassLoader(IcebergRestMetadataCommitter.class.getClassLoader());
-
-            this.restCatalog = initRestCatalog(restConfigs, hadoopConf);
+            this.restCatalog = initRestCatalog(restConfigsOf(options), newHadoopConf());
         } catch (Exception e) {
             throw new RuntimeException(
                     "Fail to initialize iceberg rest catalog for table: " + icebergTableIdentifier,
                     e);
+        }
+    }
+
+    static TableIdentifier icebergIdentifier(Options options, Identifier identifier) {
+        String database = IcebergOptions.icebergDatabaseName(options, identifier);
+        String tableName = IcebergOptions.icebergTableName(options, identifier);
+        return TableIdentifier.of(Namespace.of(database), tableName);
+    }
+
+    private static Configuration newHadoopConf() {
+        Configuration hadoopConf = new Configuration();
+        hadoopConf.setClassLoader(IcebergRestMetadataCommitter.class.getClassLoader());
+        return hadoopConf;
+    }
+
+    static Map<String, String> restConfigsOf(Options options) {
+        return new IcebergOptions(options).icebergRestConfig();
+    }
+
+    /** The dropper of this storage: one REST client, one drop. */
+    static final class Dropper implements IcebergMirrorDropper {
+        private final RESTCatalog restCatalog;
+        private final TableIdentifier identifier;
+
+        Dropper(Options options, Identifier table) {
+            this(
+                    initRestCatalog(restConfigsOf(options), newHadoopConf()),
+                    icebergIdentifier(options, table));
+        }
+
+        @VisibleForTesting
+        Dropper(RESTCatalog restCatalog, TableIdentifier identifier) {
+            this.restCatalog = restCatalog;
+            this.identifier = identifier;
+        }
+
+        @Override
+        public void drop() {
+            try {
+                if (restCatalog.dropTable(identifier, false)) {
+                    LOG.info("Dropped {} from the REST catalog; its files stay.", identifier);
+                } else {
+                    LOG.info("{} is not in the REST catalog; nothing to drop.", identifier);
+                }
+            } catch (NoSuchTableException e) {
+                LOG.info("{} is not in the REST catalog; nothing to drop.", identifier);
+            }
+        }
+
+        /**
+         * A server can check the access before the existence and refuse a table that is gone. Then
+         * a namespace that is gone still shows that the table is gone.
+         */
+        @Override
+        public boolean exists() {
+            try {
+                return restCatalog.tableExists(identifier);
+            } catch (NoSuchNamespaceException e) {
+                return false;
+            } catch (ForbiddenException e) {
+                try {
+                    restCatalog.listTables(identifier.namespace());
+                } catch (NoSuchNamespaceException gone) {
+                    return false;
+                }
+                throw e;
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            restCatalog.close();
         }
     }
 
@@ -489,7 +549,7 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 ((BaseTable) icebergTable).operations().current(), newMetadata, true);
     }
 
-    private RESTCatalog initRestCatalog(Map<String, String> restConfigs, Configuration conf) {
+    static RESTCatalog initRestCatalog(Map<String, String> restConfigs, Configuration conf) {
         restConfigs.put(ICEBERG_CATALOG_TYPE, "rest");
         Catalog catalog = CatalogUtil.buildIcebergCatalog(REST_CATALOG_NAME, restConfigs, conf);
         return (RESTCatalog) catalog;

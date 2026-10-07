@@ -18,6 +18,7 @@
 
 package org.apache.paimon.iceberg;
 
+import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.options.ConfigOption;
 import org.apache.paimon.options.ConfigOptions;
 import org.apache.paimon.options.Options;
@@ -313,6 +314,18 @@ public class IcebergOptions {
         public InlineElement getDescription() {
             return TextElement.text(description);
         }
+    }
+
+    /** The name of the Iceberg database of a table: the option, or the Paimon database. */
+    public static String icebergDatabaseName(Options options, Identifier table) {
+        String value = options.get(METASTORE_DATABASE);
+        return value != null && !value.isEmpty() ? value : table.getDatabaseName();
+    }
+
+    /** The name of the Iceberg table of a table: the option, or the Paimon table name. */
+    public static String icebergTableName(Options options, Identifier table) {
+        String value = options.get(METASTORE_TABLE);
+        return value != null && !value.isEmpty() ? value : table.getTableName();
     }
 
     public static List<String> metastoreDatabases(Options options, String fallbackDatabase) {

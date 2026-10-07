@@ -18,21 +18,26 @@
 
 package org.apache.paimon.iceberg;
 
-import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.factories.Factory;
-import org.apache.paimon.options.Options;
-import org.apache.paimon.table.FileStoreTable;
+/**
+ * Drops the Iceberg table of a table that no longer exists. The files stay: they belong to the
+ * table and its own drop removes them. Created by {@link
+ * IcebergMetadataCommitterFactory#createDropper}; a storage that keeps no catalog entry returns
+ * none.
+ */
+public interface IcebergMirrorDropper extends AutoCloseable {
 
-/** Factory to create {@link IcebergMetadataCommitter}. */
-public interface IcebergMetadataCommitterFactory extends Factory {
-
-    IcebergMetadataCommitter create(FileStoreTable table);
+    /** Drops the table in the catalog. A table that does not exist is not an error. */
+    void drop();
 
     /**
-     * A dropper for the Iceberg table that {@code table} would have under {@code options}, or null
-     * when this storage keeps no catalog entry. The table itself may be gone.
+     * Whether the table is still in the catalog. The writer asks after a failed drop: a table that
+     * is gone needs no retry. Throws when the catalog cannot tell. A dropper that cannot ask says
+     * the table exists, so the drop is retried.
      */
-    default IcebergMirrorDropper createDropper(Options options, Identifier table) {
-        return null;
+    default boolean exists() throws Exception {
+        return true;
     }
+
+    @Override
+    default void close() throws Exception {}
 }
