@@ -57,6 +57,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.exceptions.ForbiddenException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -980,6 +982,52 @@ public class IcebergRestMetadataCommitterTest {
         dropper.drop();
         dropper.close();
         assertThat(restCatalog.tableExists(TableIdentifier.of("mydb", "t"))).isTrue();
+    }
+
+    @Test
+    public void testTheDropperTellsWhetherTheTableExists() throws Exception {
+        FileStoreTable table = createAndMirrorOnce();
+        Options options = Options.fromMap(table.options());
+        IcebergRESTMetadataCommitterFactory factory = new IcebergRESTMetadataCommitterFactory();
+        try (IcebergMirrorDropper present =
+                        factory.createDropper(options, Identifier.create("mydb", "t"));
+                IcebergMirrorDropper absent =
+                        factory.createDropper(options, Identifier.create("mydb", "absent"));
+                IcebergMirrorDropper noNamespace =
+                        factory.createDropper(options, Identifier.create("nodb", "t"))) {
+            assertThat(present.exists()).isTrue();
+            assertThat(absent.exists()).isFalse();
+            assertThat(noNamespace.exists()).isFalse();
+        }
+    }
+
+    @Test
+    public void testARefusedCheckFindsAGoneNamespace() throws Exception {
+        TableIdentifier id = TableIdentifier.of("scratch", "t");
+        IcebergMirrorDropper gone =
+                new IcebergRestMetadataCommitter.Dropper(refusingCatalog(false), id);
+        IcebergMirrorDropper unknown =
+                new IcebergRestMetadataCommitter.Dropper(refusingCatalog(true), id);
+        assertThat(gone.exists()).isFalse();
+        assertThatThrownBy(unknown::exists).isInstanceOf(ForbiddenException.class);
+    }
+
+    /** Refuses each existence check of a table, as a server that checks the access first. */
+    private static RESTCatalog refusingCatalog(boolean namespaceExists) {
+        return new RESTCatalog() {
+            @Override
+            public boolean tableExists(TableIdentifier identifier) {
+                throw new ForbiddenException("not authorized to perform operation 'loadTable'");
+            }
+
+            @Override
+            public List<TableIdentifier> listTables(Namespace namespace) {
+                if (!namespaceExists) {
+                    throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+                }
+                return Collections.emptyList();
+            }
+        };
     }
 
     @Test

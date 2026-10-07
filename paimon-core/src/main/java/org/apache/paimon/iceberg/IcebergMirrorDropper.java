@@ -29,6 +29,15 @@ public interface IcebergMirrorDropper extends AutoCloseable {
     /** Drops the table in the catalog. A table that does not exist is not an error. */
     void drop();
 
+    /**
+     * Whether the table is still in the catalog. The writer asks after a failed drop: a table that
+     * is gone needs no retry. Throws when the catalog cannot tell. A dropper that cannot ask says
+     * the table exists, so the drop is retried.
+     */
+    default boolean exists() throws Exception {
+        return true;
+    }
+
     @Override
     default void close() throws Exception {}
 }

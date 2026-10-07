@@ -147,6 +147,7 @@ class IcebergSyncOperatorTest {
         ThrowingListener.linkageError = false;
         ThrowingListener.openFails = false;
         RecordingDropperFactory.failing.set(false);
+        RecordingDropperFactory.exists.set(true);
         if (harness != null) {
             harness.close();
         }
@@ -510,6 +511,63 @@ class IcebergSyncOperatorTest {
         assertThat(operator.failures("db.gone")).isEqualTo(0);
         assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
         assertThat(syncsBuilt.get()).as("the retry of a drop is no sync").isEqualTo(0);
+    }
+
+    @Test
+    void testAFailedDropOfAGoneTableIsDone() throws Exception {
+        RecordingDropperFactory.drops.clear();
+        RecordingDropperFactory.failing.set(true);
+        RecordingDropperFactory.exists.set(false);
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(operator.failures("db.gone")).as("nothing is held").isEqualTo(0);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
+        assertThat(TestingMetricUtils.getCounter(metrics(), "mirrors_dropped").getCount())
+                .isEqualTo(1L);
+    }
+
+    @Test
+    void testAFailedDropOfAPresentTableIsHeld() throws Exception {
+        RecordingDropperFactory.failing.set(true);
+        RecordingDropperFactory.exists.set(true);
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(operator.failures("db.gone")).isEqualTo(1);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(1);
+    }
+
+    @Test
+    void testAFailedDropIsHeldWhenTheCheckFails() throws Exception {
+        RecordingDropperFactory.failing.set(true);
+        RecordingDropperFactory.exists.set(null);
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(operator.failures("db.gone")).isEqualTo(1);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(1);
+    }
+
+    @Test
+    void testAHeldDropOfATableThatIsGoneLaterIsDone() throws Exception {
+        RecordingDropperFactory.failing.set(true);
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(operator.failures("db.gone")).isEqualTo(1);
+
+        RecordingDropperFactory.exists.set(false);
+        harness.setProcessingTime(30_000);
+        assertThat(operator.failures("db.gone")).isEqualTo(0);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
+    }
+
+    @Test
+    void testASuccessfulDropDoesNotCheckTheExistence() throws Exception {
+        RecordingDropperFactory.drops.clear();
+        RecordingDropperFactory.exists.set(null);
+        startHarness("recording");
+        harness.processElement(IcebergSyncTask.drop("db", "gone"), 0);
+        assertThat(RecordingDropperFactory.drops).containsExactly("db.gone");
+        assertThat(operator.failures("db.gone")).isEqualTo(0);
+        assertThat(harness.numProcessingTimeTimers()).isEqualTo(0);
     }
 
     @Test

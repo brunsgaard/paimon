@@ -49,6 +49,8 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.ForbiddenException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.rest.Endpoint;
@@ -164,8 +166,15 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
         private final TableIdentifier identifier;
 
         Dropper(Options options, Identifier table) {
-            this.identifier = icebergIdentifier(options, table);
-            this.restCatalog = initRestCatalog(restConfigsOf(options), newHadoopConf());
+            this(
+                    initRestCatalog(restConfigsOf(options), newHadoopConf()),
+                    icebergIdentifier(options, table));
+        }
+
+        @VisibleForTesting
+        Dropper(RESTCatalog restCatalog, TableIdentifier identifier) {
+            this.restCatalog = restCatalog;
+            this.identifier = identifier;
         }
 
         @Override
@@ -178,6 +187,26 @@ public class IcebergRestMetadataCommitter implements IcebergMetadataCommitter {
                 }
             } catch (NoSuchTableException e) {
                 LOG.info("{} is not in the REST catalog; nothing to drop.", identifier);
+            }
+        }
+
+        /**
+         * A server can check the access before the existence and refuse a table that is gone. Then
+         * a namespace that is gone still shows that the table is gone.
+         */
+        @Override
+        public boolean exists() {
+            try {
+                return restCatalog.tableExists(identifier);
+            } catch (NoSuchNamespaceException e) {
+                return false;
+            } catch (ForbiddenException e) {
+                try {
+                    restCatalog.listTables(identifier.namespace());
+                } catch (NoSuchNamespaceException gone) {
+                    return false;
+                }
+                throw e;
             }
         }
 

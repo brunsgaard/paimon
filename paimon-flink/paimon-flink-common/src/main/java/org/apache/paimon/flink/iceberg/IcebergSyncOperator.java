@@ -64,9 +64,9 @@ import java.util.function.Consumer;
  * pending snapshots from the hint, so the sync tasks that arrive during a held sync are ignored. A
  * held drop is retried as a drop. A drop task replaces a held sync, because the table is gone. A
  * sync task replaces a held drop, because the table exists again. A held sync of a table that is
- * gone, and a held drop of a table that exists again, release the hold. The holds are not
- * checkpointed: after a restart the source emits the pending snapshots again, but a held drop is
- * lost.
+ * gone, and a held drop of a table that exists again, release the hold. A drop that fails is done
+ * when the dropper finds that the Iceberg table is already gone. The holds are not checkpointed:
+ * after a restart the source emits the pending snapshots again, but a held drop is lost.
  *
  * <p>The {@link IcebergSyncListener}s found with {@link ServiceLoader} hear each mirrored snapshot
  * and each dropped mirror on the task thread. A listener call that fails is counted and never
@@ -512,7 +512,7 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
             return;
         }
         try (IcebergMirrorDropper d = dropper) {
-            d.drop();
+            dropOrFindGone(task, d);
         }
         dropped.inc();
         if (listeners.isEmpty()) {
@@ -526,6 +526,34 @@ public class IcebergSyncOperator extends KeyedProcessFunction<String, IcebergSyn
         } catch (Exception | LinkageError e) {
             listenerFailures.inc();
             LOG.warn("Table {}: the listeners are not told about the drop.", task.fullName(), e);
+        }
+    }
+
+    /**
+     * A failed drop of an Iceberg table that is already gone is done. The catalog can refuse such a
+     * drop, for example when it checks the access before the existence. If the table exists, or the
+     * check fails too, the drop fails.
+     */
+    private static void dropOrFindGone(IcebergSyncTask task, IcebergMirrorDropper dropper)
+            throws Exception {
+        try {
+            dropper.drop();
+        } catch (Exception e) {
+            boolean exists;
+            try {
+                exists = dropper.exists();
+            } catch (Exception check) {
+                e.addSuppressed(check);
+                throw e;
+            }
+            if (exists) {
+                throw e;
+            }
+            LOG.info(
+                    "Table {}: the Iceberg table is already gone; the drop is done. The drop failed"
+                            + " with: {}",
+                    task.fullName(),
+                    e.toString());
         }
     }
 

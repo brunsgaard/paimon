@@ -28,15 +28,18 @@ import org.apache.paimon.table.FileStoreTable;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Records the drops it is asked for. Registered with the identifier {@code recording}. While {@link
- * #failing} is set, a drop throws and is not recorded.
+ * #failing} is set, a drop throws and is not recorded. {@link #exists} is the answer of the
+ * existence check; null makes the check throw.
  */
 public class RecordingDropperFactory implements IcebergMetadataCommitterFactory {
 
     static final List<String> drops = new CopyOnWriteArrayList<>();
     static final AtomicBoolean failing = new AtomicBoolean(false);
+    static final AtomicReference<Boolean> exists = new AtomicReference<>(true);
 
     @Override
     public String identifier() {
@@ -50,11 +53,23 @@ public class RecordingDropperFactory implements IcebergMetadataCommitterFactory 
 
     @Override
     public IcebergMirrorDropper createDropper(Options options, Identifier table) {
-        return () -> {
-            if (failing.get()) {
-                throw new IllegalStateException("The catalog is not reachable.");
+        return new IcebergMirrorDropper() {
+            @Override
+            public void drop() {
+                if (failing.get()) {
+                    throw new IllegalStateException("The catalog is not reachable.");
+                }
+                drops.add(table.getFullName());
             }
-            drops.add(table.getFullName());
+
+            @Override
+            public boolean exists() {
+                Boolean answer = exists.get();
+                if (answer == null) {
+                    throw new IllegalStateException("The catalog cannot tell.");
+                }
+                return answer;
+            }
         };
     }
 }
